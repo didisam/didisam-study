@@ -35,4 +35,4 @@ src/
 ## 배포
 
 `main` 브랜치에 push하면 GitHub Actions(`.github/workflows/deploy.yml`)가 GitHub Pages로 배포합니다.
-`main`/`dev`로 향하는 PR은 빌드만 검증합니다.
+`main`으로 향하는 PR은 빌드만 검증합니다.
