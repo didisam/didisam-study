@@ -1,0 +1,54 @@
+---
+sidebar_position: 2
+title: 스터디 노트 쓰기
+description: 트랙별 스터디 노트를 추가하는 방법
+---
+
+# 스터디 노트 쓰기
+
+스터디 노트는 `docs/<트랙>/` 아래에 둡니다. 사이드바는 폴더 구조로 **자동 생성**됩니다.
+
+```text
+docs/
+├── intro.mdx
+├── frontend/
+│   ├── _category_.json      # 트랙 이름 · 순서
+│   ├── index.mdx            # 트랙 개요 (카테고리 첫 페이지)
+│   └── rendering/           # 주제 폴더 (선택)
+│       ├── _category_.json
+│       └── hydration.mdx
+├── backend/
+└── ...
+```
+
+## 노트 Front matter
+
+```mdx title="docs/frontend/rendering/hydration.mdx"
+---
+title: Hydration 이해하기
+description: SSR 이후 클라이언트에서 일어나는 일
+sidebar_position: 1
+tags: [react, ssr]
+---
+```
+
+- `sidebar_position` — 같은 폴더 안에서의 순서
+- `sidebar_label` — 사이드바에 제목과 다른 이름을 쓰고 싶을 때
+
+## 주제 폴더 만들기
+
+주제가 여러 노트로 나뉘면 폴더를 만들고 `_category_.json`을 둡니다.
+
+```json title="docs/frontend/rendering/_category_.json"
+{
+  "label": "렌더링",
+  "position": 1,
+  "link": {"type": "generated-index", "description": "브라우저 렌더링과 React 렌더링"}
+}
+```
+
+## 새 트랙 추가
+
+1. `docs/<트랙>/` 폴더와 `_category_.json`, `index.mdx`를 만듭니다.
+2. 홈 화면 카드에 노출하려면 `src/data/tracks.ts`에 항목을 추가합니다.
+3. 블로그에서도 쓰려면 `blog/tags.yml`에 태그를 추가합니다.

@@ -1,0 +1,82 @@
+---
+sidebar_position: 1
+title: 블로그 글 쓰기
+description: DIDISAM Study 블로그에 글을 발행하는 방법
+---
+
+# 블로그 글 쓰기
+
+## 1. 저자 등록 (최초 1회)
+
+`blog/authors.yml`에 본인 정보를 추가합니다. 등록하면 [멤버](/blog/authors) 페이지에 노출됩니다.
+
+```yaml title="blog/authors.yml"
+github-id:
+  name: 홍길동
+  title: Backend Engineer
+  url: https://github.com/github-id
+  image_url: https://github.com/github-id.png
+  page: true
+  socials:
+    github: github-id
+```
+
+## 2. 글 파일 만들기
+
+`blog/` 아래에 **`YYYY-MM-DD-slug/index.mdx`** 형태로 폴더를 만듭니다. 이미지는 같은 폴더에 둡니다.
+
+```text
+blog/
+└── 2026-11-20-react-server-components/
+    ├── index.mdx
+    └── thumbnail.png
+```
+
+## 3. Front matter 작성
+
+```mdx title="blog/2026-11-20-react-server-components/index.mdx"
+---
+slug: react-server-components
+title: React Server Components 톺아보기
+description: 목록 카드와 검색 결과에 노출되는 한두 문장 요약
+authors: [github-id]
+tags: [frontend]
+image: ./thumbnail.png
+---
+
+도입부 한두 문단 — 목록과 홈 화면 카드에 미리보기로 노출됩니다.
+
+{/* truncate */}
+
+## 본문
+```
+
+| 필드 | 필수 | 설명 |
+| --- | --- | --- |
+| `title` | ✅ | 글 제목 |
+| `description` | ✅ | 홈 카드 · SEO 요약문 |
+| `authors` | ✅ | `authors.yml`의 키 |
+| `tags` | ✅ | `blog/tags.yml`에 등록된 태그만 사용 가능 |
+| `slug` | 권장 | URL 경로 (영문 kebab-case) |
+| `image` | 권장 | 대표 이미지 — 홈 카드 썸네일, OG 이미지 (16:9 권장) |
+| `draft` | | `true`면 로컬에서만 보이고 배포되지 않음 |
+
+:::warning[태그는 tags.yml에 등록된 것만]
+등록되지 않은 태그나 저자를 쓰면 빌드가 실패합니다. 새 태그가 필요하면 `blog/tags.yml`에 함께 추가해 주세요.
+:::
+
+:::note[truncate 마커]
+`{/* truncate */}` 위쪽만 목록에 미리보기로 표시됩니다. 빠뜨리면 빌드 시 경고가 납니다.
+:::
+
+## 4. 로컬에서 확인
+
+```bash
+cd my-website
+npm ci
+npm start   # http://localhost:3000/didisam-study/
+```
+
+## 5. Pull Request
+
+`dev` 브랜치에서 작업 브랜치를 만들어 PR을 올립니다. PR에서는 빌드가 자동으로 검증되고, `main`에 머지되면 GitHub Pages로 배포됩니다.

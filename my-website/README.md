@@ -1,43 +1,38 @@
-# Website
+# DIDISAM Study
 
-This website is built using [Docusaurus](https://docusaurus.io/), a modern static website generator.
+산타 개발자들의 공개 스터디 & 기술 블로그. [Docusaurus](https://docusaurus.io/) 3로 만들었습니다.
 
-## Installation
+- 사이트: https://didisam.github.io/didisam-study/
+- 글쓰기 가이드: `docs/guide/` (사이트의 **스터디 노트 → 참여 가이드**)
 
-```bash
-npm install
-```
-
-**Note**: feel free to use the package manager of your choice.
-
-## Local Development
+## 로컬 실행
 
 ```bash
-npm run start
+npm ci
+npm start          # http://localhost:3000/didisam-study/
+npm run build      # 프로덕션 빌드 (깨진 링크가 있으면 실패)
+npm run typecheck
 ```
 
-This command starts a local development server and opens up a browser window. Most changes are reflected live without having to restart the server.
+## 구조
 
-## Build
-
-```bash
-npm run build
+```text
+blog/                 # 블로그 글 (YYYY-MM-DD-slug/index.mdx)
+├── authors.yml       # 저자(멤버) 목록
+└── tags.yml          # 사용 가능한 태그 목록
+docs/                 # 스터디 노트 (폴더 = 트랙, 사이드바 자동 생성)
+├── intro.mdx
+├── frontend/ backend/ infra/ ai/ cs/
+└── guide/            # 참여 가이드
+src/
+├── pages/index.tsx   # 홈
+├── components/       # PostCard 등
+├── data/tracks.ts    # 홈에 노출되는 트랙 정의
+├── plugins/site-data.ts  # 최신 글·노트 수를 홈에 제공하는 로컬 플러그인
+└── css/custom.css    # 테마 토큰 · 전역 스타일
 ```
 
-This command generates static content into the `build` directory and can be served using any static contents hosting service.
+## 배포
 
-## Deployment
-
-Using SSH:
-
-```bash
-USE_SSH=true npm run deploy
-```
-
-Not using SSH:
-
-```bash
-GIT_USER=<Your GitHub username> npm run deploy
-```
-
-If you are using GitHub Pages for hosting, this command is a convenient way to build the website and push to the `gh-pages` branch.
+`main` 브랜치에 push하면 GitHub Actions(`.github/workflows/deploy.yml`)가 GitHub Pages로 배포합니다.
+`main`/`dev`로 향하는 PR은 빌드만 검증합니다.

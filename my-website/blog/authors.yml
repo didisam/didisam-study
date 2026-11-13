@@ -1,25 +1,23 @@
-yangshun:
-  name: Yangshun Tay
-  title: Ex-Meta Staff Engineer, Co-founder GreatFrontEnd
-  url: https://linkedin.com/in/yangshun
-  image_url: https://github.com/yangshun.png
+# 블로그 저자 목록. 글 front matter의 `authors: [키]` 로 참조한다.
+# 등록된 저자는 /blog/authors 페이지(멤버)에 노출된다.
+# @see https://docusaurus.io/docs/blog#global-authors
+#
+# 새 멤버 추가 예시:
+# github-id:
+#   name: 홍길동
+#   title: Backend Engineer
+#   url: https://github.com/github-id
+#   image_url: https://github.com/github-id.png
+#   page: true
+#   socials:
+#     github: github-id
+#     linkedin: linkedin-id
+
+didisam:
+  name: DIDISAM Study
+  title: 산타 개발자 스터디
+  url: https://github.com/didisam
+  image_url: https://github.com/didisam.png
   page: true
   socials:
-    x: yangshunz
-    linkedin: yangshun
-    github: yangshun
-    newsletter: https://www.greatfrontend.com
-
-slorber:
-  name: Sébastien Lorber
-  title: Docusaurus maintainer
-  url: https://sebastienlorber.com
-  image_url: https://github.com/slorber.png
-  page:
-    # customize the url of the author page at /blog/authors/<permalink>
-    permalink: '/all-sebastien-lorber-articles'
-  socials:
-    x: sebastienlorber
-    linkedin: sebastienlorber
-    github: slorber
-    newsletter: https://thisweekinreact.com
+    github: didisam

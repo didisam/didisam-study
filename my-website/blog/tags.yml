@@ -1,19 +1,42 @@
-facebook:
-  label: Facebook
-  permalink: /facebook
-  description: Facebook tag description
+# 사용 가능한 태그 목록. 여기에 없는 태그를 쓰면 빌드가 실패한다(onInlineTags: 'throw').
+# @see https://docusaurus.io/docs/blog#global-tags
 
-hello:
-  label: Hello
-  permalink: /hello
-  description: Hello tag description
+announcement:
+  label: 공지
+  permalink: /announcement
+  description: 스터디 운영 소식과 공지
 
-docusaurus:
-  label: Docusaurus
-  permalink: /docusaurus
-  description: Docusaurus tag description
+frontend:
+  label: Frontend
+  permalink: /frontend
+  description: 웹 프론트엔드, React, TypeScript, 웹 성능
 
-hola:
-  label: Hola
-  permalink: /hola
-  description: Hola tag description
+backend:
+  label: Backend
+  permalink: /backend
+  description: 서버, API 설계, 데이터베이스, 분산 시스템
+
+infra:
+  label: Infra
+  permalink: /infra
+  description: 클라우드, 컨테이너, CI/CD, 모니터링
+
+ai:
+  label: AI
+  permalink: /ai
+  description: LLM, 머신러닝, 데이터 파이프라인
+
+cs:
+  label: CS
+  permalink: /cs
+  description: 자료구조, 알고리즘, 네트워크, 운영체제
+
+troubleshooting:
+  label: 트러블슈팅
+  permalink: /troubleshooting
+  description: 실무에서 만난 문제와 해결 과정
+
+retrospective:
+  label: 회고
+  permalink: /retrospective
+  description: 스터디·프로젝트 회고

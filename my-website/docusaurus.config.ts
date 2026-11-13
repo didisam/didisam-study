@@ -1,40 +1,52 @@
 import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+import siteDataPlugin from './src/plugins/site-data';
 
 // This runs in Node.js - Don't use client-side code here (browser APIs, JSX...)
 
+const GITHUB_URL = 'https://github.com/didisam/didisam-study';
+const EDIT_URL = `${GITHUB_URL}/tree/main/my-website/`;
+
 const config: Config = {
-  title: 'My Site',
-  tagline: 'Dinosaurs are cool',
-  favicon: 'img/favicon.ico',
+  title: 'DIDISAM Study',
+  tagline: '함께 배우고, 기록하고, 나눕니다.',
+  favicon: 'img/favicon.svg',
 
   // Future flags, see https://docusaurus.io/docs/api/docusaurus-config#future
   future: {
     v4: true, // Improve compatibility with the upcoming Docusaurus v4
   },
 
-  // Set the production url of your site here
   url: 'https://didisam.github.io',
-  // Set the /<baseUrl>/ pathname under which your site is served
-  // For GitHub pages deployment, it is often '/<projectName>/'
   baseUrl: '/didisam-study/',
   trailingSlash: true,
 
-  // GitHub pages deployment config.
-  // If you aren't using GitHub pages, you don't need these.
-  organizationName: 'didisam', // Usually your GitHub org/user name.
-  projectName: 'didisam-study', // Usually your repo name.
+  organizationName: 'didisam',
+  projectName: 'didisam-study',
 
   onBrokenLinks: 'throw',
 
-  // Even if you don't use internationalization, you can use this field to set
-  // useful metadata like html lang. For example, if your site is Chinese, you
-  // may want to replace "en" with "zh-Hans".
   i18n: {
-    defaultLocale: 'en',
-    locales: ['en'],
+    defaultLocale: 'ko',
+    locales: ['ko'],
   },
+
+  // 한글 가독성을 위한 Pretendard 웹폰트 (dynamic subset)
+  stylesheets: [
+    {
+      href: 'https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css',
+      crossorigin: 'anonymous',
+    },
+  ],
+
+  markdown: {
+    mermaid: true,
+    hooks: {
+      onBrokenMarkdownLinks: 'warn',
+    },
+  },
+  themes: ['@docusaurus/theme-mermaid'],
 
   presets: [
     [
@@ -42,108 +54,130 @@ const config: Config = {
       {
         docs: {
           sidebarPath: './sidebars.ts',
-          // Please change this to your repo.
-          // Remove this to remove the "edit this page" links.
-          editUrl:
-            'https://github.com/didisam/didisam-study/tree/main/my-website/',
+          editUrl: EDIT_URL,
+          showLastUpdateTime: true,
+          showLastUpdateAuthor: true,
+          breadcrumbs: true,
         },
         blog: {
+          blogTitle: '블로그',
+          blogDescription: '산타 개발자들의 스터디 기록과 기술 이야기',
+          blogSidebarTitle: '전체 글',
+          blogSidebarCount: 'ALL',
+          postsPerPage: 10,
           showReadingTime: true,
           feedOptions: {
             type: ['rss', 'atom'],
             xslt: true,
+            title: 'DIDISAM Study Blog',
+            description: '산타 개발자들의 스터디 기록과 기술 이야기',
+            language: 'ko',
           },
-          // Please change this to your repo.
-          // Remove this to remove the "edit this page" links.
-          editUrl:
-            'https://github.com/didisam/didisam-study/tree/main/my-website/',
-          // Useful options to enforce blogging best practices
-          onInlineTags: 'warn',
-          onInlineAuthors: 'warn',
+          editUrl: EDIT_URL,
+          // 태그/저자는 tags.yml, authors.yml에 등록된 것만 허용
+          onInlineTags: 'throw',
+          onInlineAuthors: 'throw',
           onUntruncatedBlogPosts: 'warn',
         },
         theme: {
           customCss: './src/css/custom.css',
         },
+        sitemap: {
+          lastmod: 'date',
+          changefreq: null,
+          priority: null,
+        },
       } satisfies Preset.Options,
     ],
   ],
 
+  plugins: [siteDataPlugin],
+
   themeConfig: {
-    // Replace with your project's social card
-    image: 'img/docusaurus-social-card.jpg',
+    // TODO: 1200x630 소셜 카드 이미지를 static/img/social-card.png 로 추가하고 아래 주석 해제
+    // image: 'img/social-card.png',
+    metadata: [
+      {name: 'keywords', content: 'didisam, 디디샘, 개발 스터디, 기술 블로그'},
+    ],
     colorMode: {
       respectPrefersColorScheme: true,
     },
+    docs: {
+      sidebar: {
+        hideable: true,
+        autoCollapseCategories: true,
+      },
+    },
+    blog: {
+      sidebar: {
+        groupByYear: true,
+      },
+    },
+    tableOfContents: {
+      minHeadingLevel: 2,
+      maxHeadingLevel: 4,
+    },
     navbar: {
-      title: 'My Site',
+      title: 'DIDISAM Study',
+      hideOnScroll: true,
       logo: {
-        alt: 'My Site Logo',
+        alt: 'DIDISAM Study',
         src: 'img/logo.svg',
       },
       items: [
+        {to: '/blog', label: '블로그', position: 'left'},
         {
           type: 'docSidebar',
-          sidebarId: 'tutorialSidebar',
+          sidebarId: 'studySidebar',
           position: 'left',
-          label: 'Tutorial',
+          label: '스터디 노트',
         },
-        {to: '/blog', label: 'Blog', position: 'left'},
+        {to: '/blog/tags', label: '태그', position: 'left'},
+        {to: '/blog/authors', label: '멤버', position: 'left'},
         {
-          href: 'https://github.com/didisam/didisam-study',
-          label: 'GitHub',
+          href: GITHUB_URL,
           position: 'right',
+          className: 'header-github-link',
+          'aria-label': 'GitHub repository',
         },
       ],
     },
     footer: {
-      style: 'dark',
+      style: 'light',
       links: [
         {
-          title: 'Docs',
+          title: '콘텐츠',
           items: [
-            {
-              label: 'Tutorial',
-              to: '/docs/intro',
-            },
+            {label: '블로그', to: '/blog'},
+            {label: '스터디 노트', to: '/docs/intro'},
+            {label: '태그', to: '/blog/tags'},
           ],
         },
         {
-          title: 'Community',
+          title: '참여하기',
           items: [
-            {
-              label: 'Stack Overflow',
-              href: 'https://stackoverflow.com/questions/tagged/docusaurus',
-            },
-            {
-              label: 'Discord',
-              href: 'https://discordapp.com/invite/docusaurus',
-            },
-            {
-              label: 'X',
-              href: 'https://x.com/docusaurus',
-            },
+            {label: '글쓰기 가이드', to: '/docs/guide/writing-blog'},
+            {label: '멤버', to: '/blog/authors'},
+            {label: 'GitHub', href: GITHUB_URL},
           ],
         },
         {
-          title: 'More',
+          title: '구독',
           items: [
-            {
-              label: 'Blog',
-              to: '/blog',
-            },
-            {
-              label: 'GitHub',
-              href: 'https://github.com/didisam/didisam-study',
-            },
+            {label: 'RSS', href: 'pathname:///didisam-study/blog/rss.xml'},
+            {label: 'Atom', href: 'pathname:///didisam-study/blog/atom.xml'},
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} My Project, Inc. Built with Docusaurus.`,
+      copyright: `© ${new Date().getFullYear()} DIDISAM. All rights reserved.`,
     },
     prism: {
       theme: prismThemes.github,
-      darkTheme: prismThemes.dracula,
+      darkTheme: prismThemes.oneDark,
+      additionalLanguages: ['java', 'bash', 'sql', 'docker', 'diff'],
+    },
+    mermaid: {
+      theme: {light: 'neutral', dark: 'dark'},
     },
   } satisfies Preset.ThemeConfig,
 };
