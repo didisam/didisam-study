@@ -1,0 +1,8 @@
+{
+  "label": "성능 최적화",
+  "position": 1,
+  "link": {
+    "type": "generated-index",
+    "description": "웹 성능 측정과 프론트엔드 최적화"
+  }
+}

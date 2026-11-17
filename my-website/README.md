@@ -36,3 +36,21 @@ src/
 
 `main` 브랜치에 push하면 GitHub Actions(`.github/workflows/deploy.yml`)가 GitHub Pages로 배포합니다.
 `main`으로 향하는 PR은 빌드만 검증합니다.
+
+## 댓글 (giscus)
+
+블로그 상세 글과 스터디 노트 하단에 [giscus](https://giscus.app/ko) 댓글을 표시합니다.
+댓글은 `didisam/didisam-study` 저장소의 Discussions → Announcements에 저장됩니다.
+저장소의 Discussions가 켜져 있어야 하며, [giscus GitHub App](https://github.com/apps/giscus)을
+`Only select repositories` → `didisam-study` 대상으로 설치해야 합니다.
+
+설정은 `src/components/Comments/index.tsx`에서 관리합니다. 한국어, 반응, 라이트·다크 모드를 지원하며,
+페이지의 permalink로 토론을 구분합니다. 첫 댓글이나 반응을 남기면 토론이 생성됩니다.
+글의 slug/permalink를 바꾸면 기존 댓글과 연결이 끊어지므로 기존 토론도 함께 이전해야 합니다.
+로컬에서도 동일한 토론에 연결되므로 테스트 댓글은 실제 저장소에 남습니다.
+
+특정 글에서 댓글을 숨기려면 MD/MDX front matter에 다음을 추가합니다.
+
+```yaml
+comments: false
+```
