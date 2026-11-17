@@ -39,3 +39,11 @@ slamdunk11:
   page: true
   socials:
     github: slamdunk11
+
+JinhuiStudy:
+  name: 박진희
+  url: https://github.com/JinhuiStudy
+  image_url: https://github.com/JinhuiStudy.png
+  page: true
+  socials:
+    github: JinhuiStudy

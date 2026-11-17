@@ -1,0 +1,413 @@
+---
+title: 타임아웃만 걸면 끝일까? 재시도와 데드라인
+description: 느린 외부 API 하나가 PHP 서버를 붙잡는 이유와 재시도를 안전하게 거는 방법. 인용한 글과 공식 문서를 정리하고, 문서에 적힌 동작은 직접 돌려서 확인했다.
+sidebar_position: 1
+tags: [backend, laravel, resilience]
+---
+
+글. [박진희](/blog/authors/jinhui-study)
+
+외부 API를 부르는 코드에 `->timeout(5)` 한 줄을 넣고 나면 할 일을 다 한 것 같다. 이번에 읽은 글들은 그게 절반짜리라고 말한다. 타임아웃은 호출 한 번을 자를 뿐이고, 사용자가 실제로 기다리는 시간은 재시도와 그 사이에 쉬는 시간까지 더한 값이라서다.
+
+## 1. 인용글 정리
+
+### 재시도에는 데드라인이 필요하다
+
+> Udit Rawat, [Retries Need a Deadline, Not Just a Timeout](https://medium.com/@udit.rawat03/retries-need-a-deadline-not-just-a-timeout-a7e839b576d8), Medium, 2026-11-16
+
+글의 첫 예제는 타임아웃 0.2초로 세 번 시도하고, 시도 사이마다 0.1초씩 쉰다. 세 번 실패하는 데 약 0.54초, 두 번 쉬는 데 약 0.2초가 든다. 코드에는 0.2초라고 적혀 있는데 실제로는 0.7초 넘게 걸리는 셈이다. 시도할 때마다 시간을 새로 주기 때문이다.
+
+해법은 이렇다.
+
+- 전체 예산을 처음에 한 번만 정하고, 지금 시각에 더해 "이때까지 끝나야 한다"는 절대 시각으로 바꿔 둔다. 재시도 중에 이 값을 다시 계산하면 원래 문제로 돌아간다.
+- 시도마다 남은 시간과 시도당 상한 중 작은 쪽만 준다. 그래서 마지막 시도는 앞선 시도보다 짧을 수 있는데, 글은 그게 맞다고 말한다.
+- 쉬는 시간도 같은 예산에서 쓴다. 다음 시도를 할 시간이 없으면 시작하지 않고 멈춘다.
+- 시간은 벽시계가 아니라 단조 시계(monotonic clock)로 잰다.
+
+다시 시도할 실패와 그러면 안 되는 실패도 나눠 준다. 응답을 받기 전에 끊긴 연결, 503처럼 지금은 처리할 수 없다고 분명히 답한 경우, 시도 타임아웃은 읽기 요청이라면 다시 해 볼 만하다. 잘못된 인증 정보, 잘못된 입력, 없는 리소스, 비즈니스 규칙에 걸린 거절은 대개 다시 해도 결과가 같다. 쓰기 요청은 더 조심해야 한다. 상대가 변경을 반영한 뒤 응답만 못 받았을 수도 있어서, 원래 멱등하거나 멱등 키가 있을 때만 다시 보낸다.
+
+글은 이런 점도 짚는다.
+
+- 재시도는 한 층에서만 맡는다. 바깥에서 3번, 안에서 3번씩 시도하면 최대 9번 호출된다.
+- 남은 시간을 아래로 넘긴다. 800ms 남은 핸들러가 하위 호출에 새로 1초를 주면 안 된다. 다른 서비스로 넘길 때는 단조 시계 값을 그대로 보내면 안 되고(프로세스마다 기준점이 다르다), 남은 시간이나 프로토콜이 정한 데드라인을 보내서 받는 쪽이 다시 계산하게 한다.
+- `Retry-After`는 최소한 기다려야 하는 시간이다. 남은 예산보다 길면 그 요청 안에서는 다시 시도할 방법이 없으니 실패로 끝내는 게 맞다.
+- 값은 호출하는 쪽이 기다릴 수 있는 시간에서 거꾸로 정한다. 글쓴이는 재시도 정책을 예외 처리로만 보지 않고, 과부하를 막는 장치로도 본다.
+
+예제 코드는 Python asyncio로 쓰여 있다. PHP에서는 `hrtime(true)`가 단조 시계 역할을 한다. 매뉴얼에 이 값은 단조 증가하고 조정되지 않는다고 적혀 있다([PHP 매뉴얼: hrtime](https://www.php.net/manual/en/function.hrtime.php)).
+
+### 타임아웃 값은 응답 시간 분포에서 고른다
+
+> Marc Brooker, [Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/), Amazon Builders' Library, 2019-12-05
+
+- 같은 리전 안에서 서비스가 다른 서비스를 부를 때는 감수할 오탐 비율, 그러니까 실제로는 응답이 왔을 요청을 타임아웃으로 끊어 버리는 비율을 먼저 정한다. 0.1%로 정했다면 하위 서비스 응답 시간의 p99.9를 타임아웃으로 쓴다. 인터넷을 거치는 클라이언트처럼 네트워크 지연이 큰 경우나, p99.9가 p50에 가까운 서비스라면 여유를 더 둔다.
+- 다섯 단계로 이어진 호출에서 층마다 3번씩 시도하게 두면 맨 아래 DB가 받는 부하는 243배가 된다(3을 다섯 번 곱한 값). 그래서 가벼운 호출이라면 재시도는 스택의 한 곳에서만 하는 게 아마존의 원칙이다.
+- 서킷 브레이커는 켜졌을 때와 꺼졌을 때 시스템이 다르게 움직여서 테스트하기 어렵고, 복구를 크게 늦출 수 있다고 본다. 아마존은 그 대신 호출하는 쪽에서 토큰 버킷으로 재시도 양을 제한한다. 토큰이 남아 있는 동안은 재시도하고, 다 떨어지면 정해진 속도로만 재시도하는 방식이다. AWS SDK에는 2016년에 이 동작이 들어갔다.
+- 부작용이 있는 API는 멱등성이 보장될 때만 재시도한다. 타임아웃이 났다고 부작용이 없었다는 뜻은 아니다.
+
+### 데드라인은 위에서 정해서 아래로 물려준다
+
+> Mike Ulrich, [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/), Google SRE Book 22장
+
+- 데드라인 전파: 맨 앞(프런트엔드)에서 데드라인을 정하면, 그 요청에서 뻗어 나가는 호출은 모두 같은 절대 데드라인을 쓴다. 책의 예시대로라면 A가 30초 데드라인을 잡고 7초 일한 뒤 B를 부르면 B에는 23초가 남고, B가 4초 쓰고 C를 부르면 C에는 19초가 남는다.
+- 연쇄 장애에서 흔한 모습은 클라이언트 쪽 데드라인을 넘길 요청을 서버가 붙잡고 처리하느라 자원을 쓰는 것이다. 책은 이걸 "늦게 낸 숙제는 점수가 없다(you don't get credit for late assignments)"고 표현한다.
+- 재시도는 무작위 지수 백오프로 흩뜨리고, 요청 하나에 재시도 횟수 상한을 두고, 서버 전체에도 재시도 예산을 둔다. 책이 예로 든 값은 프로세스당 분당 60번이다. 여러 층에서 재시도하면 시도 횟수가 층마다 곱해진다는 경고는 AWS 글과 같다.
+
+### 공식 문서에 적힌 기본값
+
+| 항목 | 기본값 | 출처 |
+| --- | --- | --- |
+| Laravel HTTP 클라이언트 `timeout` | 30초 | [Laravel 13 문서: Timeout](https://laravel.com/docs/13.x/http-client#timeout) |
+| Laravel HTTP 클라이언트 `connectTimeout` | 10초 | 같은 문서 |
+| Guzzle `timeout` | 0, 응답이 올 때까지 기다린다 | [Guzzle 7 문서: request-options](https://github.com/guzzle/guzzle/blob/7.10/docs/request-options.rst) |
+| Guzzle `connect_timeout` | 0, 연결에 300초까지 기다린다 | 같은 문서 |
+| PHP `max_execution_time` | 30초 | [PHP 매뉴얼: max_execution_time](https://www.php.net/manual/en/info.configuration.php#ini.max-execution-time) |
+| PHP-FPM `request_terminate_timeout` | 0, 꺼져 있다 | [PHP 매뉴얼: FPM 설정](https://www.php.net/manual/en/install.fpm.configuration.php) |
+| nginx `fastcgi_read_timeout` | 60초, 전체 시간이 아니라 두 번의 읽기 사이 간격 | [nginx 문서](https://nginx.org/en/docs/http/ngx_http_fastcgi_module.html#fastcgi_read_timeout) |
+
+표에 다 담지 못한 내용도 있다.
+
+1. `max_execution_time`은 스크립트가 직접 쓴 시간만 센다. 매뉴얼은 `system()` 호출, 스트림 작업, DB 쿼리처럼 스크립트 바깥에서 보낸 시간은 포함하지 않는다고 적어 두었고, 윈도우만 예외로 실제 경과 시간을 잰다([PHP 매뉴얼: set_time_limit](https://www.php.net/manual/en/function.set-time-limit.php)).
+2. 라라벨 `retry()`는 세 번째 인자(재시도 조건)를 안 주면 4xx 응답도 다시 보낸다. 문서에도 클라이언트 오류나 서버 오류가 나면 재시도한다고 적혀 있고([Laravel 13 문서: Retries](https://laravel.com/docs/13.x/http-client#retries)), [PendingRequest 소스](https://github.com/laravel/framework/blob/13.x/src/Illuminate/Http/Client/PendingRequest.php)를 봐도 성공이 아닌 응답이면 조건이 없을 때 기본값이 true다. 또 `retry(3, 100)`의 3은 재시도 횟수가 아니라 최대 시도 횟수다.
+3. `Http::globalOptions()`는 라라벨 HTTP 클라이언트에만 적용된다. `Factory`가 요청 객체를 만들 때 넣는 값이라([Factory 소스](https://github.com/laravel/framework/blob/13.x/src/Illuminate/Http/Client/Factory.php)), `new GuzzleHttp\Client()`로 직접 만든 클라이언트에는 영향이 없다.
+
+### 문서대로인지 직접 돌려 봤다
+
+환경은 Docker `php:8.3-cli`(PHP 8.3.36), `illuminate/http` 13.42.0, Guzzle 7.16.2다. 라라벨 앱을 통째로 띄우지 않고, `Http` 파사드가 쓰는 `Illuminate\Http\Client\Factory`를 직접 만들어 같은 코드를 돌렸다([Http 파사드 소스](https://github.com/laravel/framework/blob/13.x/src/Illuminate/Support/Facades/Http.php)). 느린 API는 `?ms=`만큼 기다렸다가 답하는 PHP 파일 하나를 `php -S`로 띄웠다.
+
+#### 타임아웃과 재시도를 섞으면
+
+|  | 부르는 방식 | API 응답 시간 | 걸린 시간 | 결과 |
+| --- | --- | --- | --- | --- |
+| A | 기본값 | 3초 | 3.04초 | 200 |
+| B | `timeout(1)` | 3초 | 1.03초 | ConnectionException |
+| C | `timeout(1)->retry(3, 200)` | 3초 | 3.47초 | ConnectionException |
+| D | 데드라인 2초, 시도당 최대 1초, 최대 3번 | 3초 | 2.01초 | ConnectionException |
+| E | Laravel 기본값 | 35초 | 30.08초 | ConnectionException |
+| F | Guzzle `new Client()` 기본값 | 35초 | 35.01초 | 200 |
+
+재시도를 붙인 C는 같은 실패를 알아차리는 데 1초가 아니라 3.5초 가까이 걸렸다. 1 + 0.2 + 1 + 0.2 + 1 = 3.4초에 처리 시간이 조금 붙은 값이다. 상대가 느려서 실패하는 상황이라면 재시도는 이미 힘든 상대에게 같은 일을 세 번 시키는 셈이기도 하다.
+
+D는 Udit Rawat 글의 방식(전체 데드라인, 시도당 상한, 무작위 대기)을 PHP로 단순하게 옮긴 것이다. 같은 상황에서 재시도를 하면서도 2초에 끝났다. E와 F는 똑같은 35초짜리 API인데, 라라벨 클라이언트는 30초에서 끊었고 Guzzle을 그대로 쓴 쪽은 35초를 다 기다려 200을 받았다. 문서대로라면 Guzzle 기본값은 응답이 올 때까지 계속 기다린다.
+
+#### 남은 시간이 1ms 아래로 내려가면
+
+데드라인을 구현하다 보면 0에 가까운 남은 시간이 그대로 `timeout()`에 들어갈 수 있다.
+
+|  | 넣은 값 | 3초짜리 API를 불렀을 때 | 결과 |
+| --- | --- | --- | --- |
+| G | `timeout(0.5)` | 0.51초 | ConnectionException |
+| H | `timeout(0.0004)` | 3.01초 | 200 |
+| I | `timeout(0)` | 3.01초 | 200 |
+
+0.0004초를 줬는데 3초를 다 기다렸다. Guzzle은 cURL에 `timeout * 1000`을 밀리초 단위 타임아웃으로 넘기는데([CurlFactory 소스](https://github.com/guzzle/guzzle/blob/7.16.2/src/Handler/CurlFactory.php#L2215)), 1ms보다 작은 값은 정수로 바뀌면서 0이 되고, cURL에서 0은 타임아웃을 두지 않는다는 뜻이다([libcurl: CURLOPT_TIMEOUT_MS](https://curl.se/libcurl/c/CURLOPT_TIMEOUT_MS.html)). 남은 시간이 거의 없을 때는 호출 자체를 하지 말아야 한다.
+
+#### 워커 하나가 붙잡히면
+
+PHP-FPM의 `pm.max_children`은 동시에 처리하는 요청 수의 상한이다([PHP 매뉴얼: FPM 설정](https://www.php.net/manual/en/install.fpm.configuration.php)). 워커가 바깥 API를 기다리는 동안 그 워커는 다른 요청을 받지 못한다.
+
+`php -S`로 띄운 내장 서버는 단일 스레드 프로세스 하나로 돌아서 요청 하나가 막히면 전체가 멈춘다([PHP 매뉴얼: 내장 웹 서버](https://www.php.net/manual/en/features.commandline.webserver.php)). 워커가 1개인 FPM과 같은 상황이다. 여기에 3초짜리 API를 부르는 `/slow`를 0.2초 간격으로 세 번 보내고, 이어서 아무 일도 안 하는 `/fast`를 보냈다.
+
+| 요청 | 걸린 시간 |
+| --- | --- |
+| `/fast`, 혼자 보냈을 때 | 0.002초 |
+| `/slow` 1 | 3.00초 |
+| `/slow` 2 | 5.79초 |
+| `/slow` 3 | 8.59초 |
+| `/fast`, `/slow` 세 개 뒤에 보냈을 때 | 8.09초 |
+
+혼자서는 0.002초면 끝나는 `/fast`가 8초를 기다렸다. 내장 서버가 FPM과 똑같지는 않지만 그림은 같다. 워커가 50개여도 느린 바깥 호출 50개가 동시에 걸려 있으면 51번째 요청부터는 줄을 선다.
+
+얼마나 빨리 그렇게 되는지는 리틀의 법칙(동시에 처리 중인 요청 수 = 초당 요청 수 × 요청 하나에 걸리는 시간)으로 어림할 수 있다([Little's law](https://en.wikipedia.org/wiki/Little%27s_law)). 초당 20건이 들어오는 API에서 바깥 호출이 평소 0.2초에서 30초로 늘어나면, 동시에 처리 중인 요청은 4개에서 600개가 된다.
+
+#### 실행 시간 제한은 네트워크 대기를 세지 않는다
+
+`set_time_limit(2)`를 건 상태에서 세 가지를 실행한 결과다.
+
+| 한 일 | 걸린 시간 | 결과 |
+| --- | --- | --- |
+| `file_get_contents`로 5초짜리 API 기다리기 | 5.01초 | 정상 종료 |
+| Guzzle(cURL)로 5초짜리 API 기다리기 | 5.03초 | 정상 종료 |
+| CPU를 5초 동안 쓰는 반복문 | 2.00초 | `Maximum execution time of 2 seconds exceeded` |
+
+매뉴얼에 적힌 그대로다. 실행 시간 제한은 CPU를 쓰는 코드는 끊지만, 바깥 API를 기다리는 동안에는 걸리지 않는다. 기본 설정 그대로라면 PHP 안에서 느린 호출을 끊어 주는 건 HTTP 클라이언트의 타임아웃뿐이다. FPM 쪽 안전장치인 `request_terminate_timeout`은 기본이 꺼져 있다.
+
+<details>
+<summary>실험 코드 전체와 돌리는 법</summary>
+
+빈 폴더에 아래 다섯 파일을 만들고 맨 아래 명령을 돌리면 된다.
+
+```json title="composer.json"
+{
+    "require": {
+        "illuminate/http": "^13.0",
+        "guzzlehttp/guzzle": "^7.9"
+    },
+    "config": { "platform": { "php": "8.3.30" } }
+}
+```
+
+```php title="upstream.php"
+<?php
+// ?ms= 만큼 기다렸다가 답하는 느린 API
+$ms = (int) ($_GET['ms'] ?? 3000);
+usleep($ms * 1000);
+header('Content-Type: application/json');
+echo json_encode(['slept_ms' => $ms]);
+```
+
+```php title="run.php"
+<?php
+require __DIR__.'/vendor/autoload.php';
+
+use GuzzleHttp\Client;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\Factory;
+
+$http = new Factory(); // Http 파사드가 쓰는 클래스
+$up = 'http://127.0.0.1:9000';
+
+function measure(string $label, callable $fn): void
+{
+    $start = hrtime(true);
+    try {
+        $res = $fn();
+        $result = 'HTTP '.(method_exists($res, 'status') ? $res->status() : $res->getStatusCode());
+    } catch (Throwable $e) {
+        $result = (new ReflectionClass($e))->getShortName();
+    }
+    printf("%s  %.2fs  %s\n", $label, (hrtime(true) - $start) / 1e9, $result);
+}
+
+// 전체 예산 안에서만 재시도한다. 시도마다 남은 시간만 준다.
+function withDeadline(Factory $http, float $budget, float $perAttempt, int $maxAttempts, callable $send)
+{
+    $deadline = hrtime(true) + (int) ($budget * 1e9); // 한 번만 계산한다
+
+    for ($attempt = 1; ; $attempt++) {
+        $remaining = ($deadline - hrtime(true)) / 1e9;
+        if ($remaining < 0.05) { // 50ms도 안 남았으면 부르지 않는다
+            throw new RuntimeException('deadline exceeded');
+        }
+        $t = min($perAttempt, $remaining);
+
+        try {
+            return $send($http->timeout($t)->connectTimeout($t));
+        } catch (ConnectionException $e) {
+            $remaining = ($deadline - hrtime(true)) / 1e9;
+            $delay = random_int(0, 200) / 1000; // full jitter, 최대 0.2초
+            if ($attempt >= $maxAttempts || $delay >= $remaining) {
+                throw $e; // 다음 시도를 할 시간이 없으면 여기서 멈춘다
+            }
+            usleep((int) ($delay * 1e6));
+        }
+    }
+}
+
+measure('A. 기본값, 3초 API', fn () => $http->get("$up/?ms=3000"));
+measure('B. timeout(1)', fn () => $http->timeout(1)->get("$up/?ms=3000"));
+measure('C. timeout(1)->retry(3, 200)', fn () => $http->timeout(1)->retry(3, 200)->get("$up/?ms=3000"));
+measure('D. 데드라인 2초', fn () => withDeadline($http, 2.0, 1.0, 3, fn ($h) => $h->get("$up/?ms=3000")));
+measure('E. 기본값, 35초 API', fn () => $http->get("$up/?ms=35000"));
+measure('F. Guzzle new Client(), 35초 API', fn () => (new Client())->get("$up/?ms=35000"));
+measure('G. timeout(0.5)', fn () => $http->timeout(0.5)->get("$up/?ms=3000"));
+measure('H. timeout(0.0004)', fn () => $http->timeout(0.0004)->get("$up/?ms=3000"));
+measure('I. timeout(0)', fn () => $http->timeout(0)->get("$up/?ms=3000"));
+```
+
+```php title="limit.php"
+<?php
+require __DIR__.'/vendor/autoload.php';
+
+set_time_limit(2); // 실행 시간 제한 2초
+$start = hrtime(true);
+
+// 시간 제한에 걸려 멈춰도 걸린 시간은 찍히도록 종료 함수에서 출력한다
+register_shutdown_function(function () use ($start, $argv) {
+    printf("%s  %.2fs\n", $argv[1] ?? '', (hrtime(true) - $start) / 1e9);
+});
+
+match ($argv[1] ?? '') {
+    'stream' => file_get_contents('http://127.0.0.1:9000/?ms=5000'),        // 네트워크 대기 5초
+    'curl' => (new GuzzleHttp\Client())->get('http://127.0.0.1:9000/?ms=5000'), // cURL로 5초 대기
+    'cpu' => (function () use ($start) {                                     // CPU를 5초 쓰기
+        while (hrtime(true) - $start < 5e9) {
+        }
+    })(),
+};
+```
+
+```php title="app.php"
+<?php
+// /slow 는 바깥 API(3초)를 타임아웃 없이 부르고, /fast 는 바로 답한다
+$path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+if ($path === '/slow') {
+    echo file_get_contents('http://127.0.0.1:9000/?ms=3000');
+    return;
+}
+echo 'ok';
+```
+
+```bash title="돌리는 법"
+docker run --rm -v "$PWD":/app -w /app composer:2 composer install
+
+# 느린 API(9000번)는 요청이 겹쳐도 바로 받도록 워커를 넉넉히 주고,
+# app.php(8001번)는 기본 설정, 곧 워커 하나로 띄운다
+docker run --rm -v "$PWD":/app -w /app php:8.3-cli sh -c '
+  PHP_CLI_SERVER_WORKERS=8 php -S 127.0.0.1:9000 upstream.php >/dev/null 2>&1 &
+  php -S 127.0.0.1:8001 app.php >/dev/null 2>&1 &
+  sleep 1
+  php run.php
+  for k in stream curl cpu; do php limit.php $k; done
+  curl -s -o /dev/null -w "/fast 혼자: %{time_total}s\n" http://127.0.0.1:8001/fast
+  for n in 1 2 3; do
+    curl -s -o /dev/null -w "/slow $n: %{time_total}s\n" http://127.0.0.1:8001/slow &
+    sleep 0.2
+  done
+  sleep 0.3
+  curl -s -o /dev/null -w "/fast 줄 선 뒤: %{time_total}s\n" http://127.0.0.1:8001/fast
+  sleep 9'
+```
+
+숫자는 기기마다 조금씩 다르게 나온다.
+
+</details>
+
+## 2. 우리 프로젝트에 적용한다면
+
+### 호출 목록부터 만든다
+
+서비스끼리 부르는 호출과 결제나 알림 같은 바깥 업체 호출을 나누고, 사용자 요청 안에서 부르는지 배치에서 부르는지도 같이 적는다. Guzzle을 직접 만들어 쓰는 곳은 따로 표시한다. 앞에서 본 것처럼 기본값이 라라벨 클라이언트와 다르다.
+
+### 숫자는 재서 정한다
+
+지금 얼마나 걸리는지 모르면 몇 초로 할지도 못 정한다. 라라벨은 응답을 받으면 `ResponseReceived`, 응답을 못 받으면 `ConnectionFailed` 이벤트를 낸다([Laravel 13 문서: Events](https://laravel.com/docs/13.x/http-client#events)). 리스너를 하나 걸어 호스트별 소요 시간을 남겨 두면, [AWS 글](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)처럼 p99.9를 보고 타임아웃을 정할 수 있다.
+
+```php title="AppServiceProvider::boot()"
+use Illuminate\Http\Client\Events\ResponseReceived;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Log;
+
+Event::listen(function (ResponseReceived $event) {
+    Log::info('outbound_http', [
+        'host' => parse_url($event->request->url(), PHP_URL_HOST),
+        'status' => $event->response->status(),
+        'ms' => (int) round(($event->response->handlerStats()['total_time'] ?? 0) * 1000),
+    ]);
+});
+```
+
+### 기본값을 코드에 드러낸다
+
+`Http::globalOptions()`로 모든 요청의 기본 타임아웃을 정해 두고, 필요한 호출에서만 `->timeout()`으로 덮어쓴다. 서비스끼리 부르는 호출은 매크로로 묶으면 설정이 한곳에 모인다([Laravel 13 문서: Global Options](https://laravel.com/docs/13.x/http-client#global-options), [Macros](https://laravel.com/docs/13.x/http-client#macros)). 아래 숫자는 예시다.
+
+```php title="AppServiceProvider::boot()"
+Http::globalOptions([
+    'timeout' => 5,
+    'connect_timeout' => 2,
+]);
+
+Http::macro('internal', fn () => Http::timeout(2)->connectTimeout(1)->acceptJson());
+// 사용: Http::internal()->get($url)
+```
+
+Guzzle을 직접 만드는 곳에는 `globalOptions`가 닿지 않으니([Factory 소스](https://github.com/laravel/framework/blob/13.x/src/Illuminate/Http/Client/Factory.php)) 생성자에 `timeout`과 `connect_timeout`을 꼭 넣는다.
+
+### 재시도는 조건을 붙여서, 한 곳에서만
+
+라라벨 `retry()`는 조건이 없으면 4xx도 다시 보내니([Laravel 13 문서: Retries](https://laravel.com/docs/13.x/http-client#retries)) 세 번째 인자를 늘 준다. 읽기 요청에서 연결 실패와 502·503·504만 다시 시도하는 예다.
+
+```php
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\RequestException;
+
+Http::timeout(2)
+    ->retry(2, 200, function (Throwable $e) {
+        return $e instanceof ConnectionException
+            || ($e instanceof RequestException
+                && in_array($e->response->status(), [502, 503, 504], true));
+    })
+    ->get($url);
+```
+
+2는 최대 시도 횟수라서 재시도는 한 번이다. 이 호출을 감싼 쪽에서 또 재시도하고 있지 않은지도 같이 본다.
+
+결제 승인 같은 쓰기 요청은 자동으로 다시 보내지 않는다. 타임아웃이 났다고 결제가 안 됐다고 단정할 수 없어서다. [AWS 글](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)도 타임아웃이 부작용이 없었다는 뜻은 아니라고 말한다. 다시 보내는 대신 상태를 조회해서 확인하고, 멱등 키로 중복을 막는 방법은 다음 노트에서 따로 다룬다.
+
+### 사용자 요청에는 데드라인을 둔다
+
+요청이 들어올 때 전체 예산을 정하고, 하위 호출에는 남은 시간만 준다. 앞에서 봤듯이 남은 시간이 너무 작으면 타임아웃이 사라지니, 최소값보다 적게 남았으면 부르지 않는다.
+
+```php title="Deadline.php"
+final class Deadline
+{
+    private function __construct(private readonly int $endsAt) {}
+
+    public static function in(float $seconds): self
+    {
+        return new self(hrtime(true) + (int) ($seconds * 1e9));
+    }
+
+    public function remaining(): float
+    {
+        return max(0.0, ($this->endsAt - hrtime(true)) / 1e9);
+    }
+
+    // 시도당 상한과 남은 시간 중 작은 값. 50ms도 안 남았으면 부르지 않는다.
+    public function timeoutFor(float $cap, float $min = 0.05): float
+    {
+        $t = min($cap, $this->remaining());
+        if ($t < $min) {
+            throw new RuntimeException('deadline exceeded');
+        }
+
+        return $t;
+    }
+}
+
+$deadline = Deadline::in(3.0);
+$user = Http::timeout($deadline->timeoutFor(1.0))->get($userUrl);
+$orders = Http::timeout($deadline->timeoutFor(1.5))->get($ordersUrl);
+```
+
+다른 서비스로 남은 시간을 넘기려면 헤더에 실어 보내야 한다. gRPC는 `grpc-timeout` 헤더로 남은 시간을 보낸다([gRPC over HTTP2](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)). HTTP API끼리 쓰려면 헤더 이름과 단위를 우리가 먼저 정해야 한다.
+
+### 바깥 층일수록 시간을 길게 준다
+
+안쪽이 먼저 포기해야 바깥쪽에 제대로 된 오류를 돌려줄 수 있다. 앱의 데드라인, FPM의 `request_terminate_timeout`, 앞단 프록시(nginx라면 `fastcgi_read_timeout`), 로드밸런서 타임아웃 순서로 길어져야 한다. 순서가 뒤집혀 있으면 바깥은 이미 포기했는데 안쪽은 계속 일하는, [SRE 책](https://sre.google/sre-book/addressing-cascading-failures/)이 말한 "늦게 낸 숙제"가 생긴다.
+
+### 배치와 워커는 따로 정한다
+
+사용자가 기다리지 않는 작업은 길게 줘도 되지만, 작업 전체에 쓸 시간과 건당 타임아웃은 나눠서 정한다. 건당 타임아웃이 없으면 한 건이 작업 전체를 붙잡는다.
+
+## 3. 개인적인 견해
+
+타임아웃은 숫자를 정하는 게 제일 어렵다. 근거 없이 5초를 넣는 건 기본값 30초를 쓰는 것과 크게 다르지 않다고 생각한다. 둘 다 "이 정도면 되겠지"라는 점에서 같다. 그래서 순서는 재고, 정하고, 코드에 드러내는 쪽이 맞다고 본다.
+
+재시도는 보험처럼 보여서 일단 넣고 싶어진다. 그런데 실험 C에서 봤듯이 실패를 알아차리는 시간을 세 배 넘게 늘리고, 장애가 났을 때는 이미 힘든 상대에게 부하를 더 얹는다. 나는 재시도를 기본으로 끄고, 넣을 때는 PR에 "왜 다시 보내도 안전한지, 최악에 몇 초까지 걸리는지"를 적게 하는 편이 낫다고 생각한다.
+
+서킷 브레이커는 아직 이른 것 같다. 타임아웃과 데드라인이 먼저 잡혀 있어야 서킷 브레이커도 제대로 판단할 수 있다. [AWS 글](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)이 서킷 브레이커는 테스트하기 어렵고 복구를 늦출 수 있다고 짚은 것도 서두르지 않을 이유로 읽었다.
+
+PHP라서 더 조심해야 한다는 생각도 들었다. 요청 하나가 워커 하나를 끝날 때까지 잡고 있는 구조라, 바깥 호출이 느려지면 바로 처리량이 준다. `/fast`가 8초를 기다린 게 그 모습이다. 게다가 실행 시간 제한은 네트워크 대기를 세지 않아서, 기본 설정에서는 HTTP 클라이언트 타임아웃 말고는 기댈 데가 없다.
+
+데드라인 전파는 서비스 경계를 넘는 순간 헤더 이름, 단위, 시계 기준을 정해야 해서 기술보다 합의가 먼저다. 처음에는 서비스 하나 안에서 데드라인을 지키는 것만 해도 효과가 클 것 같다.
+
+결제 같은 쓰기 요청에서는 타임아웃을 "실패"로 볼지 "결과를 모름"으로 볼지가 다음 고민이다.
+
+## 참고 자료
+
+인용한 글
+
+- Udit Rawat, [Retries Need a Deadline, Not Just a Timeout](https://medium.com/@udit.rawat03/retries-need-a-deadline-not-just-a-timeout-a7e839b576d8), Medium, 2026-11-16
+- Marc Brooker, [Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/), Amazon Builders' Library, 2019-12-05
+- Mike Ulrich, [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/), Site Reliability Engineering(Google) 22장
+
+문서와 소스
+
+- [Laravel 13 문서: HTTP Client](https://laravel.com/docs/13.x/http-client) (Timeout, Retries, Global Options, Macros, Events)
+- laravel/framework 13.x: [PendingRequest.php](https://github.com/laravel/framework/blob/13.x/src/Illuminate/Http/Client/PendingRequest.php), [Factory.php](https://github.com/laravel/framework/blob/13.x/src/Illuminate/Http/Client/Factory.php), [Facades/Http.php](https://github.com/laravel/framework/blob/13.x/src/Illuminate/Support/Facades/Http.php)
+- Guzzle: [7.x 문서 request-options](https://github.com/guzzle/guzzle/blob/7.10/docs/request-options.rst), [7.16.2 CurlFactory.php](https://github.com/guzzle/guzzle/blob/7.16.2/src/Handler/CurlFactory.php#L2215)
+- [libcurl: CURLOPT_TIMEOUT_MS](https://curl.se/libcurl/c/CURLOPT_TIMEOUT_MS.html)
+- PHP 매뉴얼: [set_time_limit](https://www.php.net/manual/en/function.set-time-limit.php), [hrtime](https://www.php.net/manual/en/function.hrtime.php), [max_execution_time](https://www.php.net/manual/en/info.configuration.php#ini.max-execution-time), [FPM 설정](https://www.php.net/manual/en/install.fpm.configuration.php), [내장 웹 서버](https://www.php.net/manual/en/features.commandline.webserver.php)
+- [nginx: fastcgi_read_timeout](https://nginx.org/en/docs/http/ngx_http_fastcgi_module.html#fastcgi_read_timeout)
+- [gRPC over HTTP2: Timeout](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)
+- [Little's law](https://en.wikipedia.org/wiki/Little%27s_law)
