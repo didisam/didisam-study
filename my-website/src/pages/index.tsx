@@ -1,13 +1,13 @@
-import type {ReactNode} from 'react';
+import type { ReactNode } from 'react';
 import clsx from 'clsx';
 import Link from '@docusaurus/Link';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
-import {usePluginData} from '@docusaurus/useGlobalData';
+import { usePluginData } from '@docusaurus/useGlobalData';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
 import PostCard from '@site/src/components/PostCard';
-import type {SiteData} from '@site/src/plugins/site-data';
-import {tracks} from '@site/src/data/tracks';
+import type { SiteData } from '@site/src/plugins/site-data';
+import { tracks } from '@site/src/data/tracks';
 
 import styles from './index.module.css';
 
@@ -30,10 +30,12 @@ function SectionHeader({
     <div className={styles.sectionHeader}>
       <div>
         <p className={styles.eyebrow}>{eyebrow}</p>
-        <Heading as="h2" className={styles.sectionTitle}>
+        <Heading as='h2' className={styles.sectionTitle}>
           {title}
         </Heading>
-        {description && <p className={styles.sectionDescription}>{description}</p>}
+        {description && (
+          <p className={styles.sectionDescription}>{description}</p>
+        )}
       </div>
       {action}
     </div>
@@ -41,7 +43,7 @@ function SectionHeader({
 }
 
 function Hero(): ReactNode {
-  const {siteConfig} = useDocusaurusContext();
+  const { siteConfig } = useDocusaurusContext();
   return (
     <header className={styles.hero}>
       <div className={styles.heroGrid} aria-hidden />
@@ -51,22 +53,29 @@ function Hero(): ReactNode {
             <span className={styles.heroBadgeDot} />
             DIDISAM Engineering Study
           </p>
-          <Heading as="h1" className={styles.heroTitle}>
+          <Heading as='h1' className={styles.heroTitle}>
             배운 것을 기록하고,
             <br />
             <span className={styles.gradientText}>함께 성장합니다.</span>
           </Heading>
           <p className={styles.heroSubtitle}>
-            {siteConfig.tagline} 산타 개발자들이 스터디하며 정리한 지식과
-            경험을 공개합니다.
+            {siteConfig.tagline} 산타 개발자들이 스터디하며 정리한 지식과 경험을
+            공개합니다.
           </p>
           <div className={styles.heroActions}>
-            <Link className={clsx('button button--primary button--lg', styles.cta)} to="/blog">
+            <Link
+              className={clsx('button button--primary button--lg', styles.cta)}
+              to='/blog'
+            >
               최신 글 보기
             </Link>
             <Link
-              className={clsx('button button--secondary button--lg', styles.ctaGhost)}
-              to="/docs/intro">
+              className={clsx(
+                'button button--secondary button--lg',
+                styles.ctaGhost
+              )}
+              to='/docs/intro'
+            >
               스터디 노트 →
             </Link>
           </div>
@@ -82,8 +91,10 @@ function Hero(): ReactNode {
             <code>
               <span className={styles.tkKeyword}>const</span> study = {'{'}
               {'\n'}
-              {'  '}team: <span className={styles.tkString}>'DIDISAM'</span>,{'\n'}
-              {'  '}cadence: <span className={styles.tkString}>'weekly'</span>,{'\n'}
+              {'  '}team: <span className={styles.tkString}>'DIDISAM'</span>,
+              {'\n'}
+              {'  '}cadence: <span className={styles.tkString}>'weekly'</span>,
+              {'\n'}
               {'  '}tracks: [<span className={styles.tkString}>'FE'</span>,{' '}
               <span className={styles.tkString}>'BE'</span>,{' '}
               <span className={styles.tkString}>'Infra'</span>,{' '}
@@ -106,12 +117,12 @@ function Hero(): ReactNode {
 }
 
 function Stats(): ReactNode {
-  const {postCount, docCount, authorCount} = useSiteData();
+  const { postCount, docCount, authorCount } = useSiteData();
   const items = [
-    {label: '블로그 글', value: postCount},
-    {label: '스터디 노트', value: docCount},
-    {label: '스터디 트랙', value: tracks.length},
-    {label: '참여 멤버', value: authorCount},
+    { label: '블로그 글', value: postCount },
+    { label: '스터디 노트', value: docCount },
+    { label: '스터디 트랙', value: tracks.length },
+    { label: '참여 멤버', value: authorCount },
   ];
   return (
     <section className={styles.stats}>
@@ -128,16 +139,16 @@ function Stats(): ReactNode {
 }
 
 function RecentPosts(): ReactNode {
-  const {recentPosts} = useSiteData();
+  const { recentPosts } = useSiteData();
   return (
     <section className={styles.section}>
-      <div className="container">
+      <div className='container'>
         <SectionHeader
-          eyebrow="Latest"
-          title="최신 글"
-          description="스터디에서 다룬 주제와 실무에서 겪은 이야기를 정리합니다."
+          eyebrow='Latest'
+          title='최신 글'
+          description='스터디에서 다룬 주제와 실무에서 겪은 이야기를 정리합니다.'
           action={
-            <Link to="/blog" className={styles.moreLink}>
+            <Link to='/blog' className={styles.moreLink}>
               전체 글 보기 →
             </Link>
           }
@@ -159,28 +170,29 @@ function RecentPosts(): ReactNode {
 }
 
 function Tracks(): ReactNode {
-  const {docCountByDir} = useSiteData();
+  const { docCountByDir } = useSiteData();
   return (
     <section className={clsx(styles.section, styles.sectionMuted)}>
-      <div className="container">
+      <div className='container'>
         <SectionHeader
-          eyebrow="Tracks"
-          title="스터디 트랙"
-          description="관심 분야별로 트랙을 나누어 학습하고, 결과를 스터디 노트로 남깁니다."
+          eyebrow='Tracks'
+          title='스터디 트랙'
+          description='관심 분야별로 트랙을 나누어 학습하고, 결과를 스터디 노트로 남깁니다.'
         />
         <div className={styles.trackGrid}>
           {tracks.map((track) => (
             <Link
               key={track.dir}
               to={`/docs/${track.dir}/`}
-              className={styles.trackCard}>
+              className={styles.trackCard}
+            >
               <div className={styles.trackTop}>
                 <span className={styles.trackIcon}>{track.short}</span>
                 <span className={styles.trackCount}>
                   노트 {docCountByDir[track.dir] ?? 0}
                 </span>
               </div>
-              <Heading as="h3" className={styles.trackTitle}>
+              <Heading as='h3' className={styles.trackTitle}>
                 {track.title}
               </Heading>
               <p className={styles.trackDescription}>{track.description}</p>
@@ -223,17 +235,17 @@ const steps = [
 function Process(): ReactNode {
   return (
     <section className={styles.section}>
-      <div className="container">
+      <div className='container'>
         <SectionHeader
-          eyebrow="How we study"
-          title="이렇게 공부합니다"
-          description="배움이 개인에게 머무르지 않도록, 기록과 공유를 스터디의 기본 단위로 삼습니다."
+          eyebrow='How we study'
+          title='이렇게 공부합니다'
+          description='배움이 개인에게 머무르지 않도록, 기록과 공유를 스터디의 기본 단위로 삼습니다.'
         />
         <ol className={styles.steps}>
           {steps.map((step) => (
             <li key={step.no} className={styles.step}>
               <span className={styles.stepNo}>{step.no}</span>
-              <Heading as="h3" className={styles.stepTitle}>
+              <Heading as='h3' className={styles.stepTitle}>
                 {step.title}
               </Heading>
               <p>{step.description}</p>
@@ -248,24 +260,28 @@ function Process(): ReactNode {
 function JoinBanner(): ReactNode {
   return (
     <section className={styles.section}>
-      <div className="container">
+      <div className='container'>
         <div className={styles.banner}>
           <div>
-            <Heading as="h2" className={styles.bannerTitle}>
+            <Heading as='h2' className={styles.bannerTitle}>
               글 한 편으로 시작해 보세요
             </Heading>
             <p className={styles.bannerText}>
-              Markdown 파일 하나와 Pull Request 하나면 충분합니다. 작성 방법은 글쓰기
-              가이드에 정리해 두었어요.
+              Markdown 파일 하나와 Pull Request 하나면 충분합니다. 작성 방법은
+              글쓰기 가이드에 정리해 두었어요.
             </p>
           </div>
           <div className={styles.bannerActions}>
-            <Link className="button button--lg button--primary" to="/docs/guide/writing-blog">
+            <Link
+              className='button button--lg button--primary'
+              to='/docs/guide/writing-blog'
+            >
               글쓰기 가이드
             </Link>
             <Link
               className={clsx('button button--lg', styles.bannerGhost)}
-              href="https://github.com/didisam/didisam-study">
+              href='https://github.com/didisam/didisam-study'
+            >
               GitHub
             </Link>
           </div>
@@ -276,11 +292,12 @@ function JoinBanner(): ReactNode {
 }
 
 export default function Home(): ReactNode {
-  const {siteConfig} = useDocusaurusContext();
+  const { siteConfig } = useDocusaurusContext();
   return (
     <Layout
-      title="개발 스터디 & 기술 블로그"
-      description={`${siteConfig.title} — 산타 개발자들의 스터디 기록과 기술 이야기`}>
+      title='개발 스터디 & 기술 블로그'
+      description={`${siteConfig.title} — 산타 개발자들의 스터디 기록과 기술 이야기`}
+    >
       <Hero />
       <main>
         <Stats />
