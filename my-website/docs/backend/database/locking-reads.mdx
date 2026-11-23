@@ -1,0 +1,335 @@
+---
+title: '큐 테이블에 왜 SKIP LOCKED를 붙였을까: MySQL 잠금 읽기'
+description: 알림톡 큐를 일괄 처리로 바꾸다가 AI가 붙인 FOR UPDATE SKIP LOCKED가 궁금해서 공유 잠금, 배타 잠금, NOWAIT, SKIP LOCKED를 정리하고, MySQL 8.0과 라라벨 13에서 직접 돌려서 확인했다.
+sidebar_position: 1
+tags: [backend, mysql, laravel, lock]
+---
+
+글. [Amy](/blog/authors/kah-9509)
+
+## 요약
+
+- `FOR UPDATE SKIP LOCKED`는 여러 워커가 같은 큐 테이블을 동시에 읽을 때, 남이 잠근 행을 기다리지 않고 건너뛰어 서로 다른 행을 나눠 가져가게 한다.
+- 지금은 소비자가 하나라서 `FOR UPDATE SKIP LOCKED`가 필요 없어 보일 수 있다. 하지만 롤링 배포 중에 구 버전과 신 버전 인스턴스가 함께 뜨거나, 앞선 스케줄이 끝나기 전에 다음 실행이 시작되면 소비자는 언제든 둘 이상이 된다. 앞으로 트래픽이 늘어 소비자를 수평 확장해야 할 가능성도 고려해야 한다. 따라서 행마다 독립적으로 처리할 수 있는 작업을 담는 DB 기반 큐라면, 처음부터 여러 소비자가 동시에 선점해도 안전한 구조로 설계하는 편이 장기적인 확장성과 운영 안정성에 유리하다.
+- 옵션만으로는 부족하다. 잠금은 트랜잭션 안에서만 유지되고, 스캔한 인덱스 레코드에 걸린다. 트랜잭션 경계와 인덱스를 잘못 잡으면 워커를 늘려도 한 번에 하나만 일한다.
+
+> 재현 환경: MySQL 8.0.46(InnoDB, REPEATABLE READ), PHP 8.3, 라라벨 13.43.0
+
+## 1. 배경: 왜 궁금해졌나
+
+우리 서비스는 알림톡 발송 대기열을 MySQL 테이블 하나로 관리한다. 예전에는 한 행마다 트랜잭션을 열어 상태를 하나씩 바꿨는데, 이걸 여러 행을 한 번에 가져와 일괄로 바꾸는 방식으로 고쳤다. 그때 AI가 고친 선점 쿼리 끝에 `FOR UPDATE SKIP LOCKED`가 붙어 있었다.
+
+```php
+DB::table('alimtalk_queue')
+    ->where('status', 'pending')
+    ->orderBy('id')
+    ->limit(100)
+    ->lock('for update skip locked')
+    ->get();
+```
+
+돌아가기는 했지만 왜 이 옵션이어야 하는지는 설명할 수 없었다. 처음에는 "서버 하나가 큐를 독점해서 보니까 꼭 필요한 설정"이라고 이해했는데, 정리하고 돌려 보니 반대였다. 여러 워커가 같은 큐를 동시에 읽을 때의 문제다.
+
+AI가 이 패턴을 들고 온 것도 이상한 일은 아니다. 라라벨의 database 큐 드라이버도 job을 꺼낼 때 MySQL 8.0.1 이상(MariaDB 10.6, PostgreSQL 9.5, Vitess 19 이상)이면 `FOR UPDATE SKIP LOCKED`를 쓰고, 그 아래 버전이면 `FOR UPDATE`를 쓴다([DatabaseQueue 소스](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Queue/DatabaseQueue.php)의 `getLockForPopping()`).
+
+## 2. 핵심 개념
+
+### 2-1. 잠금은 정확성을 위해 처리량을 내준다
+
+> sayedebad.777, [Shared and Exclusive Locks in Relational Databases: FOR SHARE, FOR UPDATE, SKIP LOCKED and NOWAIT](https://medium.com/@sayedebad.777/shared-and-exclusive-locks-in-relational-databases-for-share-for-update-skip-locked-and-nowait-06047c19d23c), Medium
+
+이 글은 관계형 데이터베이스가 처음에 돈을 다루려고 만들어졌다는 데서 시작한다. 은행, 결제, 회계 시스템은 수천 명이 동시에 데이터를 바꿔도 잔액이 틀리지 않는 저장소가 필요했고, 트랜잭션과 ACID 보장과 잠금이 모두 그 필요에서 나왔다. 은행은 고객에게 틀린 잔액을 보여 주느니 잠깐 기다리게 하는 쪽을 택한다.
+
+- 트랜잭션은 중요한 값을 바꾸기 전에 그 행을 잡아 달라고 데이터베이스에 요청한다. 같은 행을 원하는 다른 트랜잭션은 앞의 트랜잭션이 끝날 때까지 기다린다. 충돌이 날 거라고 보고 미리 막는 방식이라 비관적 잠금이라고 부른다.
+- 대가는 처리량이다. 한 번에 한 트랜잭션만 만질 수 있는 행은 병렬로 처리할 수 없다. 은행 잔액이나 비행기 좌석처럼 정확성이 속도보다 중요한 데이터에는 잠금을 쓰고, 조회수 카운터처럼 몇 번 틀려도 되는 데이터에는 잠금을 생략할 수 있다. 눈앞의 데이터가 어떤 종류인지 아는 게 핵심이라고 말한다.
+- 데이터베이스가 행 옆 디스크에 "잠김" 표시를 쓰는 게 아니다. 잠금은 엔진 메모리 안의 작은 기록이고, 운영체제가 스레드에 쓰는 뮤텍스나 세마포어 같은 도구로 강제된다. 남이 잡은 잠금을 요청한 트랜잭션은 스레드가 뮤텍스를 기다리듯 그냥 기다린다.
+- 행 잠금에는 공유 잠금과 배타 잠금 두 종류가 있다. 공유 잠금은 읽기 잠금이라고도 하고, `SELECT` 끝에 `FOR SHARE`를 붙여서 잡는다. 그러면 그 문장이 돌려준 행 전부에 그 트랜잭션의 공유 잠금이 걸린다.
+
+### 2-2. MySQL에서는 이렇게 동작한다
+
+인용한 글은 데이터베이스 일반론이라, MySQL(InnoDB)에서 실제로 어떻게 동작하는지는 문서로 확인했다.
+
+| 항목 | 내용 | 출처 |
+| --- | --- | --- |
+| 일반 `SELECT` | REPEATABLE READ와 READ COMMITTED에서 일반 `SELECT`는 스냅샷을 읽는 consistent nonlocking read다. 잠금을 걸지도 않고, 남이 건 잠금을 기다리지도 않는다 | [Consistent Nonlocking Reads](https://dev.mysql.com/doc/refman/8.0/en/innodb-consistent-read.html) |
+| `FOR SHARE` | 읽은 행에 공유(S) 잠금을 건다. 다른 트랜잭션도 읽을 수는 있지만, 커밋 전까지 그 행을 바꿀 수는 없다. 8.0에서 `LOCK IN SHARE MODE`를 대신하고, `NOWAIT`, `SKIP LOCKED`, `OF`는 `FOR SHARE` 문법에서만 붙일 수 있다 | [Locking Reads](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html) |
+| `FOR UPDATE` | 읽은 행과 관련 인덱스 항목에 배타(X) 잠금을 건다. `UPDATE`를 실행한 것처럼 잠근다 | 같은 곳 |
+| 잠금의 수명 | 잠금은 트랜잭션이 커밋하거나 롤백할 때 풀린다. 잠금 읽기는 autocommit이 꺼져 있을 때(`START TRANSACTION`으로 시작했거나 `autocommit=0`)만 의미가 있다 | 같은 곳 |
+| 잠금이 걸리는 단위 | 잠금 읽기, `UPDATE`, `DELETE`는 SQL을 처리하면서 스캔한 인덱스 레코드에 잠금을 건다. `WHERE` 조건에 맞지 않아 걸러지는 행도 스캔했다면 잠긴다 | [Locks Set by Different SQL Statements](https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html) |
+| gap lock | REPEATABLE READ에서는 레코드 사이 빈 구간도 잠근다(next-key lock). READ COMMITTED에서는 검색과 인덱스 스캔에 gap lock을 쓰지 않고, 조건에 맞지 않은 행의 잠금은 `WHERE`를 평가한 뒤 푼다 | [InnoDB Locking](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html), [Transaction Isolation Levels](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html) |
+| 대기 시간 | `innodb_lock_wait_timeout` 기본값은 50초다. 기본 설정(`innodb_rollback_on_timeout=OFF`)에서는 타임아웃이 나면 트랜잭션 전체가 아니라 마지막 문장만 롤백한다 | [InnoDB Startup Options](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_lock_wait_timeout) |
+
+### 2-3. 잠긴 행을 만났을 때의 세 가지 선택
+
+| 옵션 | 잠긴 행을 만나면 | 결과 | 어울리는 곳 |
+| --- | --- | --- | --- |
+| (없음) | 풀릴 때까지 기다린다 | `innodb_lock_wait_timeout`을 넘기면 ERROR 1205 | 순서대로라도 반드시 처리해야 하는 작업 |
+| `NOWAIT` | 바로 실패한다 | ERROR 3572 | 좌석 예약처럼 지금 안 되면 바로 사용자에게 알려야 하는 경우 |
+| `SKIP LOCKED` | 건너뛴다 | 잠기지 않은 행만 돌려준다 | 여러 워커가 나눠 처리하는 작업 큐 |
+
+문서는 `SKIP LOCKED`로 읽은 결과가 일관되지 않은 뷰라서 일반적인 트랜잭션 작업에는 맞지 않고, 여러 세션이 큐 같은 테이블에 접근할 때 경합을 피하는 데 쓸 수 있다고 적었다. `NOWAIT`과 `SKIP LOCKED`는 행 잠금에만 적용되고, 이 둘을 쓴 문장은 statement 기반 복제에서 안전하지 않다([Locking Reads](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html)).
+
+워커 A와 B가 같은 큐를 동시에 읽는 상황에 대입하면 이렇다.
+
+| 방식 | 워커 A | 워커 B | 결과 |
+| --- | --- | --- | --- |
+| 잠금 없는 `SELECT` | 1~100번을 읽는다 | 같은 1~100번을 읽는다 | 같은 알림톡이 두 번 나간다 |
+| `FOR UPDATE` | 1~100번을 잠근다 | A가 커밋할 때까지 기다린다 | 중복은 없지만 한 줄로 처리된다 |
+| `FOR UPDATE SKIP LOCKED` | 1~100번을 잠근다 | 101~200번을 가져간다 | 중복도 대기도 없다 |
+
+### 2-4. 라라벨에서는
+
+1. 쿼리 빌더의 `lock()`은 값을 SQL 끝에 그대로 붙이고, 쓰기 커넥션(`useWritePdo()`)을 쓰게 한다. `lockForUpdate()`는 `lock(true)`, 곧 `FOR UPDATE`다([Query Builder 소스](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Query/Builder.php)).
+2. `DB::transaction($callback, $attempts)`은 데드락(`Deadlock found when trying to get lock`)이나 잠금 대기 타임아웃(`Lock wait timeout exceeded`) 메시지가 담긴 예외가 나면 `$attempts`만큼 트랜잭션 전체를 다시 실행한다. 바깥 트랜잭션 안에 중첩돼 있으면 다시 실행하지 않고 예외를 바깥으로 던진다([ConcurrencyErrorDetector](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/ConcurrencyErrorDetector.php), [ManagesTransactions](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Concerns/ManagesTransactions.php) 소스).
+
+## 3. 직접 확인해 보기
+
+### 3-1. 재현 환경
+
+Ubuntu 24.04의 MySQL 8.0.46(apt 패키지, 기본 설정: REPEATABLE READ, `innodb_lock_wait_timeout=50`, `binlog_format=ROW`), PHP 8.3.6, 라라벨 13.43.0 새 프로젝트에서 돌렸다. SQL 실험은 세션을 두세 개 열어 순서를 맞추려고 Python(PyMySQL)으로 짰다.
+
+큐 테이블은 이렇게 만들었다. 실험마다 테이블을 새로 만들고 `pending` 행 10건을 넣었다.
+
+```sql
+CREATE TABLE alimtalk_queue (
+    id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    status       VARCHAR(20)      NOT NULL DEFAULT 'pending',
+    payload      JSON             NOT NULL,
+    available_at DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    claimed_by   CHAR(36)         NULL,
+    claimed_at   DATETIME         NULL,
+    attempts     TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    KEY idx_queue_poll (status, id)
+) ENGINE=InnoDB;
+```
+
+### 3-2. 잠긴 행을 만나면
+
+세션 A가 `pending` 3건을 `FOR UPDATE`로 잡고 `processing`으로 바꾼 뒤 2초 있다가 커밋한다. 그 2초 사이에 세션 B가 같은 쿼리를 옵션만 바꿔 실행했다.
+
+```sql
+SELECT id FROM alimtalk_queue WHERE status = 'pending' ORDER BY id LIMIT 3 FOR UPDATE;
+```
+
+|  | B가 붙인 옵션 | B가 받은 결과 | B가 걸린 시간 |
+| --- | --- | --- | --- |
+| A | `FOR UPDATE` | 4, 5, 6 | 2.0초 |
+| B | `FOR UPDATE SKIP LOCKED` | 4, 5, 6 | 0.0초 |
+| C | `FOR UPDATE NOWAIT` | ERROR 3572 (`Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.`) | 0.0초 |
+
+A에서 B는 A가 커밋할 때까지 기다렸다가, 그사이 `processing`이 된 1~3을 빼고 4~6을 받았다. 잠금 읽기는 스냅샷이 아니라 커밋된 최신 값을 읽기 때문이다. 결과는 B와 같은데 2초를 기다렸다. B는 1~3이 잠긴 걸 보고 건너뛰어 바로 4~6을 받았다. C는 기다리지도 건너뛰지도 않고 바로 실패했다.
+
+### 3-3. 트랜잭션 없이 `FOR UPDATE`만 쓰면
+
+|  | 상황 | 결과 |
+| --- | --- | --- |
+| D | A가 autocommit 상태로 `FOR UPDATE` 실행 후, B가 같은 쿼리 실행 | A는 1, 2, 3을 받았고, 문장이 끝난 직후 `data_locks`에 남은 잠금은 0건. B도 1, 2, 3을 바로 받았다 |
+
+문장 하나가 트랜잭션 하나라서 잠금은 문장이 끝나는 순간 풀렸다. 두 워커가 같은 행을 가져가 알림톡이 두 번 나가는 구조다.
+
+### 3-4. 어떤 잠금이 걸리나
+
+세션 A가 `FOR UPDATE SKIP LOCKED`로 3건을 잡은 상태에서 세 번째 세션으로 `performance_schema.data_locks`를 봤다. `pending` 10건만 있는 테이블이다.
+
+```sql
+SELECT INDEX_NAME, LOCK_TYPE, LOCK_MODE, LOCK_DATA
+FROM performance_schema.data_locks
+WHERE OBJECT_NAME = 'alimtalk_queue';
+```
+
+| 인덱스 | 격리 수준 | 걸린 레코드 잠금 |
+| --- | --- | --- |
+| `(status, id)` | REPEATABLE READ | 보조 인덱스 3건 `X`, PRIMARY 3건 `X,REC_NOT_GAP` |
+| `(status, id)` | READ COMMITTED | 보조 인덱스 3건 `X,REC_NOT_GAP`, PRIMARY 3건 `X,REC_NOT_GAP` |
+| 없음 | REPEATABLE READ | PRIMARY 3건 `X` |
+| 없음 | READ COMMITTED | PRIMARY 3건 `X,REC_NOT_GAP` |
+
+`X`는 레코드와 그 앞 빈 구간까지 잠그는 next-key lock이고, `X,REC_NOT_GAP`은 레코드만 잠근 것이다. 문서대로 READ COMMITTED에서는 gap이 빠졌다. 이 테이블은 앞쪽 행이 전부 `pending`이라 인덱스가 없어도 3건만 읽고 멈췄다. 실제 큐는 이렇지 않아서, 다음 실험에서는 이미 보낸 행을 앞에 쌓았다.
+
+### 3-5. 이미 보낸 행이 쌓인 큐에서
+
+`sent` 990건 뒤에 `pending` 10건이 있는 테이블이다. 워커 A가 `SKIP LOCKED`로 3건을 잡은 상태에서 워커 B가 같은 쿼리를 실행했다.
+
+|  | 인덱스 | 격리 수준 | A가 건 레코드 잠금 | B가 받은 결과 |
+| --- | --- | --- | --- | --- |
+| E | 없음 | REPEATABLE READ | PRIMARY 996건 | 994, 995, 996 |
+| F | 없음 | READ COMMITTED | PRIMARY 3건 | 994, 995, 996 |
+| G | `(status, id)` | REPEATABLE READ | 보조 인덱스 3건 + PRIMARY 3건 | 994, 995, 996 |
+
+E에서 A는 3건을 가져가려고 `sent` 990건까지 전부 잠갔다. 스캔한 레코드는 조건에 맞지 않아도 잠긴다는 문서 내용 그대로다. B는 잠긴 행을 건너뛰었으니 결과는 맞았지만, 이 상태에서 오래된 `sent` 행을 지우거나 고치는 배치가 돌면 A가 끝날 때까지 기다린다. F는 조건에 맞지 않은 행의 잠금을 바로 풀어서 3건만 남았다. 인덱스가 있는 G는 필요한 행만 읽었다.
+
+### 3-6. 인덱스 순서와 `ORDER BY`가 다르면
+
+`available_at`으로 예약 발송을 거르는 쿼리를 같은 테이블에서 돌렸다.
+
+```sql
+SELECT id FROM alimtalk_queue
+WHERE status = 'pending' AND available_at <= NOW()
+ORDER BY id LIMIT 3
+FOR UPDATE SKIP LOCKED;
+```
+
+|  | 인덱스 | 정렬 | EXPLAIN Extra | A가 건 레코드 잠금 | B가 받은 결과 |
+| --- | --- | --- | --- | --- | --- |
+| H | `(status, available_at, id)` | `ORDER BY id` | Using filesort | 보조 인덱스 11건 + PRIMARY 11건 | **없음** |
+| I | `(status, available_at, id)` | `ORDER BY id`, READ COMMITTED | Using filesort | 보조 인덱스 10건 + PRIMARY 10건 | **없음** |
+| J | `(status, id)` | `ORDER BY id` | Using where | 보조 인덱스 3건 + PRIMARY 3건 | 994, 995, 996 |
+| K | `(status, available_at, id)` | `ORDER BY available_at, id` | Using where; Using index | 보조 인덱스 3건 + PRIMARY 3건 | 994, 995, 996 |
+
+이번 실험에서 가장 놀란 결과다. H는 `available_at`이 범위 조건이라 인덱스 순서로 `id`를 정렬할 수 없어서 filesort를 탔다. 정렬하려면 조건에 맞는 행을 전부 읽어야 하니, A는 3건만 가져가면서 `pending` 10건을 전부 잠갔다. B는 `SKIP LOCKED`라서 기다리지는 않았지만 받을 행이 하나도 없었다. 워커를 몇 개 띄우든 한 번에 하나만 일하는 셈이다. READ COMMITTED로 바꾼 I도 마찬가지였다. 10건 모두 조건에 맞는 행이라 풀 잠금이 없다. 인덱스 순서와 `ORDER BY`를 맞춘 J와 K는 3건만 잠갔다.
+
+### 3-7. 큐가 거의 비었을 때 새 알림톡을 넣으면
+
+`pending`이 2건뿐인 큐에서 소비자가 `LIMIT 3 FOR UPDATE SKIP LOCKED`로 2건을 잡은 상태에서, 생산자가 새 행을 `INSERT`했다(생산자 쪽 `innodb_lock_wait_timeout=3`).
+
+|  | 소비자 격리 수준 | 생산자 `INSERT` 결과 |
+| --- | --- | --- |
+| L | REPEATABLE READ | 3.0초 기다린 뒤 ERROR 1205 `Lock wait timeout exceeded` |
+| M | READ COMMITTED | 바로 들어감 |
+
+소비자는 3건을 찾으려고 마지막 `pending` 행 너머까지 스캔했고, REPEATABLE READ에서는 그 너머 빈 구간까지 잠근다. 새 행은 정확히 그 구간에 들어가야 해서 막혔다. 평소 큐는 대부분 비어 있으니, 운영에서 가장 자주 만날 모양이다. 소비자 트랜잭션이 짧으면 생산자는 잠깐 기다리고 말지만, 소비자 트랜잭션 안에서 외부 API를 부르면 그 시간만큼 알림톡 등록 요청이 멈춘다.
+
+### 3-8. `FOR SHARE`로 읽고 고치면
+
+|  | 상황 | 결과 |
+| --- | --- | --- |
+| N | A와 B가 같은 행을 `FOR SHARE`로 읽은 뒤, A가 먼저 `UPDATE`, 0.5초 뒤 B도 `UPDATE` | B는 ERROR 1213 `Deadlock found when trying to get lock`, A는 B가 롤백된 뒤 `UPDATE` 성공 |
+
+A는 B의 공유 잠금 때문에 배타 잠금으로 올리지 못하고 기다렸고, B도 A의 공유 잠금 때문에 올리지 못해서 서로를 기다리게 됐다. InnoDB가 이걸 데드락으로 보고 B를 롤백했다.
+
+### 3-9. 잠금 대기 타임아웃 뒤에 커밋하면
+
+|  | 상황 | 결과 |
+| --- | --- | --- |
+| O | 다른 세션이 2번 행을 잡고 있다. A가 1번 행을 `sent`로 바꾸고, 2번 행도 바꾸려다 1205를 받은 뒤 `COMMIT` | 1번은 `sent`, 2번은 `pending` |
+
+`innodb_rollback_on_timeout`이 기본값 OFF라서 1205가 나도 실패한 문장만 롤백됐고, 앞의 문장은 커밋에 그대로 실렸다.
+
+### 3-10. 라라벨 워커 여러 개로 돌리면
+
+선점 쿼리를 트랜잭션으로 감싼 `claim()` 메서드를 artisan 명령으로 만들어 프로세스 여러 개로 동시에 돌렸다. `pending` 2000건을 50건씩 선점해 `processing`으로 바꾸고, 선점한 id를 별도 테이블에 기록한 뒤, 트랜잭션 밖에서 20ms 쉬어 발송을 흉내 냈다. 잠금 없는 경우에는 조회와 갱신 사이에 2ms를 쉬어 경합을 흉내 냈다. 세 번 돌린 범위다.
+
+|  | 선점 방식 | 워커 | 트랜잭션 안에서 붙잡는 시간 | 걸린 시간 | 선점 기록 | 중복 |
+| --- | --- | --- | --- | --- | --- | --- |
+| P | `SKIP LOCKED` | 1 | 없음 | 1.10~1.13초 | 2000 | 0 |
+| Q | `SKIP LOCKED` | 4 | 없음 | 0.38~0.39초 | 2000 | 0 |
+| R | `FOR UPDATE` | 4 | 없음 | 0.37~0.38초 | 2000 | 0 |
+| S | 잠금 없음 | 4 | 없음 | 0.61~0.99초 | 3500~6400 | 1500~4400 |
+| T | `SKIP LOCKED` | 4 | 20ms | 0.39~0.42초 | 2000 | 0 |
+| U | `FOR UPDATE` | 4 | 20ms | 1.07~1.14초 | 2000 | 0 |
+
+S는 2000건을 최대 세 번 넘게 겹쳐 가져갔다. 알림톡으로 치면 같은 메시지가 여러 번 나간다.
+
+R은 예상과 달랐다. 트랜잭션이 선점과 상태 변경만 하고 바로 끝나니, `FOR UPDATE`로 잠깐 기다리는 시간이 거의 없어서 `SKIP LOCKED`와 차이가 없었다. 발송을 트랜잭션 안에 넣은 것처럼 20ms씩 붙잡게 하자 차이가 드러났다. U는 워커 네 개가 줄을 서서 워커 하나(P)와 비슷한 시간이 걸렸고, T는 그대로 나눠 가져갔다. `SKIP LOCKED`가 없을 때 생기는 문제는 트랜잭션이 길수록 커진다.
+
+### 3-11. "서버가 하나면 필요 없지 않나?"
+
+실험 D와 S가 보여 주듯 문제는 소비자가 둘 이상일 때 생긴다. 그래서 지금처럼 소비자가 하나라면 `SKIP LOCKED`가 필요 없어 보일 수 있다. 하지만 "소비자는 하나"라는 가정은 운영 중에도, 시간이 지나면서도 깨진다.
+
+- 롤링 배포 중에는 구 버전과 신 버전 인스턴스가 잠깐 같이 뜬다.
+- 앞 실행이 끝나기 전에 다음 스케줄이 시작된다.
+- 트래픽이 늘면 supervisor `numprocs`를 늘리거나 워커 서버를 추가해 소비자를 수평 확장하게 된다.
+
+앞의 두 경우는 운영 중에 잠깐 생기는 중첩이고, 마지막은 서비스가 커지면 언젠가 내리게 될 결정이다. 실험 Q와 T처럼 다중 소비자를 전제로 선점 구조를 짜 두면, 워커를 늘리는 일은 프로세스 수를 바꾸는 설정 변경으로 끝난다. 반대로 단일 소비자를 전제로 짰다면, 확장하는 시점에 선점 로직과 인덱스, 트랜잭션 경계를 다시 손봐야 한다.
+
+스케줄러로 돌린다면 중첩은 막아 두되, 그것과 별개로 선점 쿼리는 여러 소비자가 동시에 읽어도 안전하게 둔다. `onOneServer()`는 Redis나 database처럼 서버들이 같이 보는 캐시 드라이버가 있어야 동작한다.
+
+```php title="routes/console.php"
+Schedule::command('alimtalk:dispatch')->everyMinute()->withoutOverlapping()->onOneServer();
+```
+
+## 4. 주의사항 / 흔한 실수
+
+실험에서 본 실수를 네 갈래로 묶었다.
+
+### 4-1. 잠금이 아예 안 걸린다
+
+| 실수 | 결과 | 해결 |
+| --- | --- | --- |
+| 트랜잭션 없이 `FOR UPDATE` | 문장이 끝나는 순간 잠금이 풀려 같은 행을 두 워커가 가져간다(실험 D) | `DB::transaction()` 안에서 실행한다 |
+| 선점한 뒤 트랜잭션 밖에서 `claimed_by`로 다시 조회 | `lock()`은 쓰기 커넥션을 쓰지만, 잠금 없는 다음 조회는 읽기/쓰기 분리 설정에 따라 복제본으로 가서 복제 지연 때문에 비어 있을 수 있다 | 트랜잭션 안에서 읽은 행을 그대로 쓴다 |
+
+### 4-2. 잠금이 너무 넓게 걸린다
+
+| 실수 | 결과 | 해결 |
+| --- | --- | --- |
+| 폴링 조건에 맞는 인덱스가 없다 | REPEATABLE READ에서 스캔한 행이 전부 잠긴다(실험 E) | `(status, id)` 같은 인덱스를 둔다 |
+| 인덱스 순서와 `ORDER BY`가 다르다 | filesort 때문에 조건에 맞는 행이 전부 잠겨 다른 워커가 빈 결과를 받는다(실험 H, I) | 정렬까지 인덱스로 끝나게 맞추고, `EXPLAIN`에 `Using filesort`가 없는지 본다(실험 J, K) |
+| REPEATABLE READ에서 거의 빈 큐를 폴링 | gap lock이 생산자의 `INSERT`를 막는다(실험 L) | 소비자 트랜잭션만 READ COMMITTED로 낮춘다(실험 M) |
+| 읽기만 하는 곳에 습관처럼 `FOR UPDATE` | 처리량이 떨어지고 대기가 이어진다 | 일반 `SELECT`(스냅샷 읽기)로 충분한지 먼저 본다 |
+
+선점 트랜잭션은 스냅샷 일관성이 필요 없으니 READ COMMITTED로 낮춰도 잃는 게 없다.
+
+```php
+DB::statement('SET TRANSACTION ISOLATION LEVEL READ COMMITTED'); // 바로 다음 트랜잭션 하나에만 적용
+```
+
+`SET TRANSACTION`은 같은 커넥션의 다음 트랜잭션 하나에만 적용된다. `DB::transaction()`이 데드락으로 다시 실행할 때는 이 설정이 다시 걸리지 않으니, 재시도까지 맞추려면 커넥션 설정(`config/database.php`의 `isolation_level`)으로 따로 연결을 두는 편이 낫다.
+
+### 4-3. 잠금이 너무 오래 걸린다
+
+| 실수 | 결과 | 해결 |
+| --- | --- | --- |
+| 트랜잭션 안에서 알림톡 API를 부른다 | `FOR UPDATE`면 워커가 한 줄로 서고(실험 U), 생산자의 `INSERT`도 그만큼 기다린다(실험 L) | 선점과 발송을 나눈다(아래) |
+| 배치를 너무 크게 잡는다 | 잠금 유지 시간과 undo log가 늘어난다 | 100~500건 정도에서 재 보고 정한다 |
+| 1205를 잡고 그대로 커밋한다 | 실패한 문장만 롤백돼 절반만 반영된다(실험 O) | 콜백 안에서 예외를 삼키지 않는다. 예외가 콜백 밖으로 나가야 라라벨이 롤백하고 다시 실행한다 |
+
+```text
+[트랜잭션] pending 행 선점 → processing으로 변경 → 커밋
+           ↓
+[트랜잭션 밖] 알림톡 발송
+           ↓
+[트랜잭션] sent 또는 failed로 변경
+```
+
+### 4-4. 잠금 순서가 꼬인다
+
+| 실수 | 결과 | 해결 |
+| --- | --- | --- |
+| `FOR SHARE`로 읽은 뒤 `UPDATE` | 서로 공유 잠금을 배타 잠금으로 올리려다 데드락(실험 N) | 고칠 행이면 처음부터 `FOR UPDATE`로 잡는다 |
+| 여러 행을 서로 다른 순서로 잠근다 | A는 1→2, B는 2→1 순서로 잠그다 데드락이 날 수 있다 | 늘 같은 순서(`ORDER BY id`)로 잠근다 |
+| 데드락에 대비하지 않는다 | 간헐적으로 500 에러가 난다 | `DB::transaction($callback, attempts: 3)`으로 다시 실행한다 |
+
+### 4-5. 옵션과 큐 설계
+
+- 잔액이나 재고 합계처럼 정합성이 필요한 조회에 `SKIP LOCKED`를 쓰면 잠긴 행이 빠진 틀린 값이 나온다. 큐에만 쓴다.
+- `NOWAIT`을 쓴다면 ERROR 3572를 잡아 "다른 요청이 처리 중"이라는 응답으로 바꾼다.
+- 잠긴 행을 건너뛰므로 처리 순서가 `id` 순서와 어긋날 수 있다. 같은 사용자에게 가는 메시지끼리 순서가 중요하다면 따로 설계해야 한다.
+- `SKIP LOCKED`는 같은 행을 두 워커가 동시에 가져가는 것만 막는다. 발송은 성공했는데 `sent`로 바꾸기 전에 워커가 죽으면, `processing`에 멈춘 행을 되돌리는 작업이 그 행을 다시 내보낸다. 행마다 고유한 메시지 키를 두고, 발송사에 중복 방지 키가 있으면 그 값으로 보낸다.
+
+## 5. 대안 비교
+
+| 방식 | 장점 | 단점 | 언제 쓰나 |
+| --- | --- | --- | --- |
+| `FOR UPDATE SKIP LOCKED` | 워커끼리 기다리지 않는다. 추가 인프라가 필요 없다 | MySQL 8.0.1 이상, 처리 순서 보장 없음 | DB 큐를 여러 워커로 나눠 처리할 때 |
+| `FOR UPDATE` | 처리 순서가 안정적이다. 구버전에서도 된다 | 트랜잭션이 길면 워커가 한 줄로 선다(실험 U) | 트랜잭션이 아주 짧거나 워커가 하나일 때(실험 R) |
+| `UPDATE ... SET claimed_by = ? WHERE status = 'pending' ORDER BY id LIMIT N` 뒤에 `claimed_by`로 조회 | 잠금 읽기 없이 한 문장으로 선점한다 | 같은 행을 노리는 워커끼리는 기다린다 | MySQL 5.7 이하 |
+| 낙관적 잠금(version 컬럼) | 잠금 대기가 없다 | 충돌이 잦으면 재시도가 늘어난다 | 충돌이 드문 일반 수정 |
+| Redis, SQS 같은 전용 큐 | 처리량, 지연 큐, DLQ 등 기능이 많다 | 인프라가 늘고 DB 상태와 맞추는 일이 생긴다 | 대량 발송, 서비스 간 비동기 처리 |
+
+## 6. 정리 & 체크리스트
+
+처음에는 `SKIP LOCKED`를 "서버 하나가 큐를 독점할 때 꼭 필요한 설정"으로 이해했다. 직접 돌려 보니 소비자가 하나면 없어도 되고, 둘 이상일 때 비로소 의미가 있었다. 그렇다고 지금 소비자가 하나라는 이유로 빼지는 않겠다. 배포나 스케줄 중첩으로 소비자가 잠깐 둘이 되는 일은 매번 막기 어렵고, 트래픽이 늘면 소비자를 수평 확장해야 할 때도 온다. 행마다 독립적으로 처리할 수 있는 작업을 담는 DB 기반 큐라면, 처음부터 여러 소비자가 동시에 선점해도 안전한 구조로 설계하는 편이 장기적인 확장성과 운영 안정성에 유리하다고 본다.
+
+더 크게 남은 건 옵션 자체보다 그 옵션이 기대는 전제들이다. 트랜잭션 안에 있어야 하고(실험 D), 트랜잭션이 짧아야 하고(실험 U, L), 인덱스로 필요한 행만 읽어야 한다(실험 H). 실험 R처럼 트랜잭션이 짧으면 `FOR UPDATE`만으로도 충분히 빨랐다. AI가 붙여 준 옵션 한 줄보다 선점과 발송을 나눈 구조가 더 많은 일을 하고 있었던 셈이다.
+
+- [ ] 선점 쿼리가 트랜잭션 안에 있다
+- [ ] 알림톡 API 호출이 트랜잭션 밖에 있다
+- [ ] 폴링 쿼리의 `EXPLAIN`에 `Using filesort`가 없다
+- [ ] 소비자 트랜잭션의 격리 수준을 검토했다
+- [ ] `processing`에 멈춘 행을 되돌리는 작업이 있다
+- [ ] 중복 발송을 막는 메시지 키가 있다
+- [ ] 트랜잭션 콜백 안에서 예외를 삼키지 않는다
+- [ ] 데드락 재시도(`attempts`)를 설정했다
+
+## 참고 자료
+
+인용한 글
+
+- sayedebad.777, [Shared and Exclusive Locks in Relational Databases: FOR SHARE, FOR UPDATE, SKIP LOCKED and NOWAIT](https://medium.com/@sayedebad.777/shared-and-exclusive-locks-in-relational-databases-for-share-for-update-skip-locked-and-nowait-06047c19d23c), Medium
+
+문서와 소스
+
+- MySQL 8.0 Reference Manual: [Locking Reads](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html) (Locking Read Concurrency with NOWAIT and SKIP LOCKED), [InnoDB Locking](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html), [Locks Set by Different SQL Statements in InnoDB](https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html), [Consistent Nonlocking Reads](https://dev.mysql.com/doc/refman/8.0/en/innodb-consistent-read.html), [Transaction Isolation Levels](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html), [The data_locks Table](https://dev.mysql.com/doc/refman/8.0/en/performance-schema-data-locks-table.html), [innodb_lock_wait_timeout](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_lock_wait_timeout)
+- Laravel 13 문서: [Pessimistic Locking](https://laravel.com/docs/13.x/queries#pessimistic-locking), [Database Transactions](https://laravel.com/docs/13.x/database#database-transactions), [Preventing Task Overlaps](https://laravel.com/docs/13.x/scheduling#preventing-task-overlaps), [Running Tasks on One Server](https://laravel.com/docs/13.x/scheduling#running-tasks-on-one-server)
+- Laravel 13.43.0 소스: [DatabaseQueue](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Queue/DatabaseQueue.php), [Query Builder](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Query/Builder.php), [ConcurrencyErrorDetector](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/ConcurrencyErrorDetector.php), [ManagesTransactions](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Concerns/ManagesTransactions.php)
