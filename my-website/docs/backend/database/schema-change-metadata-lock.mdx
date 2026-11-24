@@ -1,0 +1,979 @@
+---
+title: '배포 중에 ALTER 한 줄이 서비스를 멈출 때: 메타데이터 락과 무중단 스키마 변경'
+description: 0.01초면 끝나는 컬럼 추가가 왜 API를 몇 초씩 멈추게 하는지, 배포 중에 스키마를 바꾸려면 무엇을 지켜야 하는지. 인용한 글과 MySQL, 라라벨 문서를 정리하고, MySQL 8.4와 라라벨 13에서 직접 돌려서 확인했다.
+sidebar_position: 2
+tags: [backend, mysql, laravel, migration, lock]
+---
+
+글. [박진희](/blog/authors/jinhui-study)
+
+배포 스크립트의 `php artisan migrate`가 테이블에 컬럼 하나를 추가한다. MySQL 8.4라면 INSTANT 알고리즘으로 테이블 크기와 상관없이 0.01초 안팎에 끝나는 작업이다. 그런데 그 사이에 API가 몇 초씩 멈추고 커넥션이 쌓이는 일이 생긴다. 이때 느려진 요청을 보면 대개 ALTER 뒤에 줄을 선 평범한 SELECT와 UPDATE다. ALTER가 무언가를 기다리는 동안, 같은 테이블을 쓰는 요청이 전부 그 뒤에서 기다린다. 이 줄은 테이블 정의를 지키는 메타데이터 락(metadata lock, MDL) 때문에 생긴다. 행 잠금(`FOR UPDATE`, `SKIP LOCKED`)은 Amy가 [앞 글](./locking-reads.mdx)에서 정리했으니, 이 글은 테이블 단위에서 벌어지는 일을 다룬다.
+
+## 1. 인용글 정리
+
+### 긴 트랜잭션 하나가 테이블을 멈춘다
+
+> Simon Ninon, [Don't break production: learn about MySQL locks](https://simon-ninon.medium.com/dont-break-production-learn-about-mysql-locks-297671ec8e73), Medium, 2021-08-01
+
+MySQL 5.6을 몇 년 쓰다 8.0으로 올린 서비스 이야기다. 몇 주 동안 시험하고 올렸고, 한 달 반 동안은 아무 문제가 없었다. 그러다 정기 배포 중에 마이그레이션을 돌리자 주 복제본에서 쿼리 수천 개가 끝나지 않고 멈췄고, 웹 서버까지 같이 멈췄다. 복제본을 재부팅하는 것 말고는 방법이 없었고, 원인을 찾던 이틀 뒤 배포에서 같은 일이 또 났다.
+
+원인은 두 가지가 겹친 것이었다.
+
+- MySQL 8.0.3부터 메타데이터 락이 외래 키로 엮인 테이블까지 넓어졌다. 외래 키를 추가하는 마이그레이션은 이제 자기 테이블뿐 아니라 참조하는 테이블에도 메타데이터 락을 요청한다. 이 서비스의 마이그레이션은 사용자 테이블을 참조하는 외래 키를 추가하고 있었다.
+- DDL이 요청하는 배타 메타데이터 락은 그 테이블에 공유 메타데이터 락을 쥔 요청이 하나도 없어야 잡힌다. 읽기 쿼리도 공유 메타데이터 락을 쥔다. 보통은 쿼리가 끝나면 바로 놓지만, 긴 트랜잭션 안에서 그 테이블을 한 번이라도 읽었다면 커밋이나 롤백할 때까지 쥐고 있다.
+
+그러면 DDL은 그 트랜잭션이 끝날 때까지 기다리고, DDL 뒤에 들어온 읽기 쿼리도 전부 그 뒤에서 기다린다. MySQL은 쓰기 락 요청을 읽기 락 요청보다 먼저 들어준다. 그렇게 하지 않으면 읽기가 끊임없이 들어오는 테이블에서 DDL은 락을 영영 못 잡을 수도 있다. 글쓴이는 MySQL 셸 세 개로 이 상황을 재현했다. 첫 세션에서 트랜잭션을 열어 테이블을 읽고 그대로 두고, 둘째 세션에서 그 테이블을 참조하는 외래 키를 만들고, 셋째 세션에서 그 테이블을 읽으면 둘째와 셋째가 모두 멈춘다. 5.6, 5.7, 8.0에서 해 봤는데 8.0.3 이상에서만 재현됐다.
+
+긴 트랜잭션의 주인은 오래된 Django(1.5) 서비스였다. 자동 커밋을 끈 설정이라, 누군가 Django 셸을 열어 두면 몇 시간짜리 트랜잭션이 됐다. 글쓴이는 재발을 막을 일로 몇 가지를 꼽는다. 문제가 생긴 DB 노드를 라우팅에서 빼지 못했던 것, 예상 못 한 긴 트랜잭션을 감시하는 것, 그리고 여러 팀이 DB 하나를 같이 쓰지 않고 팀마다 따로 쓰는 것이다.
+
+### 큰 테이블을 마이그레이션 안에서 채우지 않는다
+
+> Udit Rawat, [Do Not Backfill Large Laravel Tables Inside a Migration](https://medium.com/@udit.rawat03/do-not-backfill-large-laravel-tables-inside-a-migration-39882bf31372), Medium, 2026-11-14
+
+라라벨 13을 대상으로 쓴 글이다. 마이그레이션은 스키마 변경을 적어 두기에는 좋은 곳이지만, 오래 걸리는 데이터 재작성을 돌리기에는 대개 나쁜 곳이라고 말한다. 예로 드는 건 `customers.name`을 `display_name`으로 바꾸는 일이다. 마이그레이션 하나로 이름을 바꿔도 되는 건 애플리케이션을 완전히 멈출 수 있고, 모든 프로세스가 한꺼번에 새 버전으로 바뀌고, 실제 테이블과 DB 엔진에서 그 작업을 시험해 봤을 때뿐이다. 롤링 배포에서는 웹 인스턴스가 겹치고, 큐 워커는 아직 옛 코드를 돌리고 있을 수 있고, 큰 테이블을 고치는 작업은 그걸 시작한 배포 명령보다 오래 갈 수 있다.
+
+그래서 네 단계로 나눈다. 스키마를 넓히고(expand), 양쪽과 호환되는 코드를 배포하고, 기존 행을 채우고(백필, backfill), 스키마를 좁힌다(contract).
+
+1. 새 컬럼을 nullable로 추가한다. 옛 컬럼은 이름도 바꾸지 말고 지우지도 않는다. 라라벨 13의 `instant()`와 `lock()`은 DB에 하는 요청이지 어디서나 통하는 안전장치가 아니라서, 실제 서버 버전과 테이블 정의에서 되는지 확인하고 쓰라고 한다.
+2. 호환 릴리스에서는 옛 컬럼을 기준으로 두고 두 컬럼에 함께 쓴다. 새 코드가 이미 채워진 `display_name`을 먼저 읽으면, 옛 워커가 `name`만 바꾼 행에서 낡은 값을 돌려줄 수 있어서다. 직접 부르는 `update()`, 가져오기, 관리 도구, 원시 SQL까지 쓰는 곳을 모두 찾아야 한다.
+3. 백필은 마이그레이션이 아니라 따로 만든 명령이나 작업으로 한다. 정해진 크기로 나눠 처리하고 다시 돌려도 안전해야 하며, 아직 안 채워진 행만 고친다. 오프셋 대신 기본 키로 넘어가는 `chunkById()`를 쓰고, 명령 전체를 트랜잭션 하나로 감싸지 않는다. 그러면 단계를 나눠서 피하려던 긴 트랜잭션이 다시 생긴다. 두 컬럼이 다른 행을 마지막으로 맞추는 작업은 옛 버전이 모두 사라진 뒤에 한다.
+4. 모든 프로세스가 새 컬럼을 알고, 모든 쓰기가 새 컬럼을 채우고, 비거나 다른 행이 없다는 걸 확인한 뒤에야 NOT NULL을 건다. `change()`는 유지할 수식어를 모두 다시 적어야 한다. 옛 컬럼은 같은 릴리스에서 지우지 않고, 옛 컬럼을 읽고 쓰는 코드를 걷어 낸 릴리스가 다 배포된 뒤에 따로 지운다.
+
+맺음말은 '무중단'이라는 구호를 경계한다. 모든 중간 상태에 정해진 동작이 있어야 하고, 파괴적인 단계는 앞 단계가 끝났다는 증거가 나올 때까지 기다려야 한다고 말한다.
+
+### 메타데이터만 바꿨는데 Reader가 튄다
+
+> Eden, [Aurora MySQL 인덱스 DDL이 Reader 버퍼풀을 비운다?](https://medium.com/daangn/aurora-mysql-%EC%9D%B8%EB%8D%B1%EC%8A%A4-ddl%EC%9D%B4-reader-%EB%B2%84%ED%8D%BC%ED%92%80%EC%9D%84-%EB%B9%84%EC%9A%B4%EB%8B%A4-16c6328dea50), 당근 테크 블로그, 2026-09-17
+
+당근 DB팀이 한 서비스의 Aurora MySQL 3.10.x 클러스터(Writer 1대, Reader 3대)에서 겪은 일이다. 쓰지 않는 인덱스를 바로 지우지 않고, 먼저 `INVISIBLE`로 바꿔 옵티마이저가 못 보게 한 뒤 며칠 지켜보려 했다. 메타데이터만 바꾸는 작업이라 부담이 없다고 봤다. 그런데 `INVISIBLE`을 실행할 때마다 Reader 3대의 ReadIOPS가 평소 수백에서 3.1K로, CPU가 30%에서 50~60%로 튀었다. Writer는 평소와 같았다.
+
+Reader의 버퍼풀을 보니 페이지 수는 그대로인데, `INNODB_BUFFER_PAGE`의 `IS_STALE`이 `YES`인 페이지가 급증했다. 숨긴 인덱스는 하나인데 PRIMARY를 포함한 그 테이블의 모든 인덱스에서 페이지 94~98%가 무효가 됐다. 무효화 단위가 인덱스가 아니라 테이블 전체였다.
+
+DDL 종류별로 재현해 보니 INSTANT 컬럼 추가나 컬럼 기본값 변경은 영향이 없었고, 인덱스를 만들거나 지우거나 숨기는 작업은 테이블 데이터를 다시 만들지 않는데도 테이블 전체를 무효로 만들었다. AWS는 3.08.0에서 들어온 동작이 의도보다 넓게 적용된 엔진 결함이라고 확인했고, 3.14에 고칠 예정이며 그 이전 버전에 백포트할 계획은 없다고 답했다. 그때까지 글이 권하는 운영 기준은 두 가지다. 인덱스 DDL은 트래픽이 적은 시간에 하고, 인덱스 여러 개를 바꿀 때는 ALTER 하나로 묶어 무효화를 한 번으로 줄인다.
+
+2026-10-26에 나온 Aurora MySQL 3.14.0(MySQL 8.0.46 호환) 릴리스 노트에는 같은 증상을 고친 것으로 보이는 항목이 있다. reader 인스턴스에서 재구성 없는 온라인 인덱스 DDL(CREATE INDEX, DROP INDEX, ALTER INDEX ... INVISIBLE) 뒤에 read I/O와 지연이 잠깐 튀던 문제를 고쳤다는 내용이다([Aurora MySQL 3.14.0 릴리스 노트](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraMySQLReleaseNotes/AuroraMySQL.Updates.3140.html)).
+
+### DB 엔지니어가 소스로 확인한 것
+
+> joom.out, [MySQL ALTER DDL 수행 방식에 대한 이해](https://tech.kakao.com/posts/703), 카카오 기술 블로그, 2025-05-14
+>
+> joom.out, [MySQL Ver. 8.0 New Feature: Instant DDL Algorithm에 대한 이해](https://tech.kakao.com/posts/731), 카카오 기술 블로그, 2025-09-02
+
+카카오에서 MySQL을 운영하는 DB 엔지니어가 MySQL 8.0.32 소스를 따라가며 ALTER가 알고리즘마다 메타데이터 락을 어떻게 바꿔 잡는지 정리한 글이다. INPLACE는 배타 메타데이터 락을 두 번(준비 단계와 커밋 직전), INSTANT는 한 번 잡는다. 그래서 INSTANT도 "잠깐이지만 서비스에 영향이 있을 수 있다"고 적었다. 결론은 두 가지다. ALTER에는 ALGORITHM을 꼭 적어서 예상보다 느린 알고리즘으로 조용히 바뀌는 걸 막는다. 그리고 어떤 DDL이든 배타 메타데이터 락을 짧게라도 잡으니, ALTER 전에 오래 도는 트랜잭션이 없는지 먼저 확인한다.
+
+두 번째 글은 INSTANT를 8.0.19부터 써 온 경험담이다. 8.0.12에서 1.6GB 테이블에 컬럼을 추가하는 데 0.01초가 걸렸다. 8.0.29부터 생긴 행 버전 한도(64개)를 다 쓴 뒤에 `ALGORITHM=INSTANT`를 적지 않고 DDL을 돌리면 INPLACE로 바뀌어 돌아가니 의도치 않은 결과가 될 수 있다고 주의를 준다. 글에는 이때의 오류 번호가 4080으로 나오는데, MySQL 문서에 이 번호가 잘못 적혀 있었고 실제 번호는 4092다([MySQL Bug #117745](https://bugs.mysql.com/bug.php?id=117745)). 아래 실험에서도 4092가 나왔다.
+
+### 도구를 써도 마지막 순간에는 락을 잡는다
+
+> Peter Sylvester, [Online DDL Tools and Metadata Locks](https://www.percona.com/blog/online-ddl-tools-and-metadata-locks/), Percona, 2022-11-23
+>
+> GitHub, [GitHub availability report: May 2026](https://github.blog/news-insights/company-news/github-availability-report-may-2026/), The GitHub Blog
+
+Percona 글은 고객이 자주 하는 말로 시작한다. 지난번에 메타데이터 락으로 고생했으니 DDL 방식을 바꾸고 싶다는 말이다. 글쓴이는 메타데이터 락은 피할 수 없고 도구를 바꿔도 소용없다고 답한다. 테이블을 바꿀 때는 테이블과 데이터 딕셔너리를 맞추려고 반드시 메타데이터 락이 필요하다. 이 락을 잡으려면 진행 중인 쿼리가 끝나길 기다려야 하고, 그 뒤에 온 쿼리는 다시 이 락을 기다린다. 글은 INSTANT ALTER, pt-online-schema-change, gh-ost로 차례로 보여 준다.
+
+gh-ost 예시에서는 원본 테이블과 새 테이블을 맞바꾸는 cut-over 단계가 다른 세션이 쥔 락에 걸려 1205로 몇 번 실패했다. 그 락이 풀린 뒤에야 끝나면서 "Lock & rename duration: 5.975493692s. During this time, queries on `t1` were blocked"라는 로그를 남겼다. 결론은 변경할 때 오래 도는 쿼리를 감시하고, 방해가 되면 가능한 경우 끊으라는 것이다.
+
+GitHub 보고서는 2026-05-04 15:34~16:40 UTC에 github.com 응답이 느려지고 실패가 늘었던 장애를 다룬다. 고객 영향은 약 1시간 6분이었고, 정점에는 요청의 약 1.3%가 5xx였다. 계기는 크고 많이 읽히는 테이블에 돌던 평범한 온라인 스키마 마이그레이션이었다. 몇 시간 동안 문제없이 돌다가 주간 최대 트래픽 시간대로 갈수록 사용량이 오르자, 마이그레이션 부하와 평소 트래픽이 합쳐져 DB 커넥션 용량이 바닥났다. 재발 방지책은 큰 테이블 마이그레이션을 트래픽이 적은 시간에 맞추고, 실시간 부하에 맞춰 속도를 조절하고, DB 지연이나 커넥션 사용률이 안전선을 넘으면 진행 중인 마이그레이션을 자동으로 멈추는 차단기를 넣는 것이다. 메타데이터 락과는 다른 이야기다. 도구로 테이블을 천천히 복사해도, 그 부하가 평소 트래픽과 겹치면 장애가 될 수 있다.
+
+### 문서와 소스에 적힌 규칙
+
+MySQL 8.4 문서에서 이 글과 관련된 규칙을 모았다.
+
+| 항목 | 내용 | 출처 |
+| --- | --- | --- |
+| 락을 쥐는 기간 | 트랜잭션 안에서 쓴 테이블의 메타데이터 락은 트랜잭션이 끝날 때까지 놓지 않는다 | [Metadata Locking](https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html#metadata-lock-release) |
+| 줄 서는 순서 | 쓰기 락 요청이 읽기 락 요청보다 먼저다. 예외를 만드는 `max_write_lock_count`는 기본값이 아주 커서 보통은 해당이 없다 | 같은 문서 [Metadata Lock Acquisition](https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html#metadata-lock-acquisition) |
+| 외래 키 | 외래 키로 엮인 테이블까지 필요한 만큼 메타데이터 락을 넓힌다 | 같은 곳 |
+| 온라인 DDL의 락 | 시작할 때 공유 업그레이드 가능(shared upgradeable) 락을 잡고, 커밋할 때 배타 락으로 올린다. 배타 락은 잡고 나면 짧지만, 기다리는 동안에는 그 뒤에 오는 트랜잭션을 막는다. INSTANT도 실행 단계에서 배타 락을 짧게 잡을 수 있다 | [Online DDL Performance and Concurrency](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-performance.html#innodb-online-ddl-metadata-locks) |
+| 알고리즘 고르기 | `ALGORITHM`을 안 적으면 INSTANT, 안 되면 INPLACE, 그것도 안 되면 COPY를 쓴다. 적으면 그 알고리즘으로 하거나 오류로 끝난다 | [ALTER TABLE](https://dev.mysql.com/doc/refman/8.4/en/alter-table.html#alter-table-performance) |
+| INSTANT와 LOCK | `ALGORITHM=INSTANT`에는 `LOCK=DEFAULT`만 쓸 수 있다 | 같은 문서 [Concurrency Control](https://dev.mysql.com/doc/refman/8.4/en/alter-table.html#alter-table-concurrency) |
+| 컬럼 추가 | 8.4에서는 INSTANT가 기본이고, 아무 위치에나 추가할 수 있다. INSTANT로 추가·삭제할 때마다 행 버전이 하나씩 늘고 64개(9.1.0부터 255개)까지 허용된다 | [Online DDL Operations](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html#online-ddl-column-syntax-notes) |
+| 타입·길이 변경 | 데이터 타입 변경은 COPY만 된다. VARCHAR는 256바이트 미만에서 256바이트 이상으로 늘릴 때 INPLACE가 안 된다 | 같은 곳 |
+| 인덱스 추가 | 보조 인덱스 추가는 INPLACE이고 그동안 읽기와 쓰기를 허용한다 | 같은 문서 [Index Operations](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html#online-ddl-index-operations-table) |
+| 대기 시간 | `lock_wait_timeout`은 메타데이터 락을 기다리는 초다. 기본값은 31536000(1년)이고, 락을 시도할 때마다 따로 적용된다. 행 잠금을 기다리는 `innodb_lock_wait_timeout`(기본 50초)과는 다른 설정이다 | [lock_wait_timeout](https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_lock_wait_timeout) |
+| 진단 | `performance_schema.metadata_locks`에 누가 어떤 락을 쥐었고(GRANTED) 기다리는지(PENDING)가 나온다. `sys.schema_table_lock_waits`는 기다리는 세션과 막는 세션을 짝지어 보여 준다 | [metadata_locks](https://dev.mysql.com/doc/refman/8.4/en/performance-schema-metadata-locks-table.html), [schema_table_lock_waits](https://dev.mysql.com/doc/refman/8.4/en/sys-schema-table-lock-waits.html) |
+
+라라벨 13 문서와 소스(v13.43.0)에서 확인한 것이다.
+
+1. 컬럼 정의에 `instant()`를 붙이면 `ALGORITHM=INSTANT`, `lock('none')` 같은 걸 붙이면 `LOCK=NONE`이 SQL 끝에 붙는다. 문법 클래스는 수식어를 붙이기만 하고 조합을 따지지 않는다([MySqlGrammar](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Schema/Grammars/MySqlGrammar.php#L318-L326)). 인덱스와 외래 키에는 `inplace()`가 있다. `instant()`는 12.40.1([#57907](https://github.com/laravel/framework/pull/57907)), `lock()`은 12.46.0([#58293](https://github.com/laravel/framework/pull/58293)), `inplace()`는 13.33.0([#61602](https://github.com/laravel/framework/pull/61602))에 들어왔다. `inplace()` PR은 큰 테이블에 외래 키 인덱스를 추가하던 마이그레이션이 테이블을 잠가 부분 장애가 났던 경험에서 나왔다고 적었다.
+2. 문서는 `instant()`가 "테이블 끝에만 컬럼을 붙일 수 있어서 `after`, `first`와 함께 쓸 수 없다"고 한다. 이건 MySQL 8.0.28까지의 제약이다. 8.0.29부터는 아무 위치에나 INSTANT로 추가할 수 있다. 문서가 링크한 MySQL 문서도 8.0판이다([Laravel 13 문서: Instant Column Operations](https://laravel.com/docs/13.x/migrations#instant-column-operations)).
+3. 문서는 "`lock` 수식어를 `instant`와 함께 써서 더 최적화할 수 있다"며 `$table->string('name')->instant()->lock('none');`을 예로 든다([DDL Locking](https://laravel.com/docs/13.x/migrations#ddl-locking)). 위 표의 MySQL 규칙과 어긋난다. 아래에서 돌려 봤다.
+4. `Schema::table()` 안에서 컬럼을 여러 개 추가하면 컬럼마다 ALTER 문이 따로 나간다([Blueprint](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Schema/Blueprint.php#L194-L209)).
+5. MySQL에서는 마이그레이션을 트랜잭션으로 감싸지 않는다. 스키마 문법의 `$transactions`가 기본 `false`이고 PostgreSQL과 SQL Server만 `true`다([Grammar](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Schema/Grammars/Grammar.php#L31), [Migrator](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Migrations/Migrator.php#L452-L455)). 어차피 MySQL의 DDL은 실행하면 바로 커밋된다.
+6. `migrate --isolated`는 캐시 드라이버로 원자적 락을 잡는다. 락을 못 잡은 쪽은 마이그레이션을 실행하지 않고 성공 코드로 끝난다고 문서에 적혀 있다([Isolating Migration Execution](https://laravel.com/docs/13.x/migrations#isolating-migration-execution)). `--isolated=75`처럼 숫자를 주면 그 숫자를 종료 코드로 쓴다([Command 소스](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Console/Command.php#L278-L287)).
+
+### 문서대로인지 직접 돌려 봤다
+
+환경은 Docker `php:8.3-cli`(PHP 8.3.37), MySQL 8.4.13 기본 설정(REPEATABLE READ, `lock_wait_timeout` 31536000, `innodb_lock_wait_timeout` 50), 라라벨 13.43.0 새 프로젝트, gh-ost 1.1.11이다. 세션 여러 개가 정해진 시각에 문장을 실행하게 하는 PHP 스크립트로 순서를 맞췄다. 시간은 각 세션이 그 문장을 보낸 뒤 결과를 받기까지 걸린 시간이다.
+
+#### 열린 트랜잭션 하나가 ALTER와 그 뒤 쿼리를 막는다
+
+행 3개짜리 `orders` 테이블이다. 세션 tx가 트랜잭션을 열어 한 행을 읽고 5초 뒤에 커밋한다. 그 사이 1초에 INSTANT 컬럼 추가, 2초에 다른 행 SELECT, 2.5초에 또 다른 행 UPDATE를 보냈다.
+
+|  | 상황 | ALTER | 뒤에 온 SELECT | 뒤에 온 UPDATE |
+| --- | --- | --- | --- | --- |
+| A | 읽기만 한 트랜잭션이 열려 있다 | 4.01초 기다린 뒤 성공 | 3.00초 | 2.51초 |
+| B | 트랜잭션 없이 4초 걸리는 SELECT가 돌고 있다 | 3.51초 | 3.01초 | |
+| C | A와 같고 ALTER 세션만 `lock_wait_timeout = 3` | 3.00초 뒤 ERROR 1205 | 2.00초 (ALTER가 실패하자 풀림) | |
+
+A에서 3초 시점의 `performance_schema.metadata_locks`는 이랬다.
+
+```text
+id  테이블  락 종류            상태     PROCESSLIST 상태                 쿼리
+13  orders  SHARED_READ        GRANTED                                   (열린 트랜잭션)
+12  orders  SHARED_UPGRADABLE  GRANTED  Waiting for table metadata lock  ALTER TABLE orders ADD COLUMN …
+12  orders  EXCLUSIVE          PENDING  Waiting for table metadata lock  ALTER TABLE orders ADD COLUMN …
+14  orders  SHARED_READ        PENDING  Waiting for table metadata lock  SELECT * FROM orders WHERE id = 2
+15  orders  SHARED_WRITE       PENDING  Waiting for table metadata lock  UPDATE orders SET amount = …
+```
+
+트랜잭션 tx는 SELECT 한 번을 끝내고 아무것도 안 하고 있었는데, 공유 락(SHARED_READ)을 쥐고 있었다. ALTER는 배타 락(EXCLUSIVE)을 기다리고, 그 뒤의 SELECT와 UPDATE는 ALTER 뒤에 줄을 섰다. 다른 행을 읽고 쓰는 쿼리인데도 그렇다. 행 잠금과 상관없이 테이블 단위로 줄을 서기 때문이다. 세 세션 모두 `SHOW PROCESSLIST`의 상태가 `Waiting for table metadata lock`이었다. 테이블에 행이 3개뿐인데 INSTANT ALTER가 4초 걸렸으니, ALTER가 얼마나 걸릴지는 테이블 크기보다 그 테이블에 열린 트랜잭션이 얼마나 오래 가느냐에 달려 있다.
+
+B처럼 트랜잭션이 없어도 같은 일이 생긴다. 오래 걸리는 쿼리 하나도 끝날 때까지 공유 락을 쥔다.
+
+C에서 ALTER는 3초 기다린 뒤 실패했고, 그 순간 줄 서 있던 SELECT가 바로 풀렸다. 실패한 ALTER는 아무것도 바꾸지 않았다. 오류 번호는 행 잠금 대기 시간을 넘겼을 때와 같은 1205(`Lock wait timeout exceeded; try restarting transaction`)라서, 오류 메시지만 보고는 어느 쪽 락인지 구분할 수 없다.
+
+C의 실패를 그대로 끝내지 않고 다시 시도하면 어떻게 되는지도 봤다. 7초짜리 트랜잭션이 열린 동안 ALTER를 `lock_wait_timeout = 1`로 걸고, 1205가 나면 2초 쉬고 다시 시도했다. 그 사이 1초마다 SELECT를 보냈다.
+
+|  | ALTER 시도 | 결과 | SELECT가 가장 오래 기다린 시간 |
+| --- | --- | --- | --- |
+| D | 1번째(1초), 2번째(4초) | 각각 1.01초 뒤 1205 | 0.51초 |
+|  | 3번째(7초, tx 커밋 직후) | 바로 성공 | |
+
+ALTER가 기다리는 1초 동안 들어온 SELECT만 잠깐 기다렸고, 쉬는 동안에는 바로 처리됐다. 비슷하게 열린 트랜잭션에 걸렸는데 A에서는 SELECT가 3초를 기다렸고, D에서는 가장 길어야 0.51초였다.
+
+`sys.schema_table_lock_waits`에는 한 가지 함정이 있었다. A 상황에서 이 뷰는 기다리는 세션 셋(ALTER, SELECT, UPDATE)마다 막는 세션을 두 줄씩 보여 줬다. 하나는 열린 트랜잭션(13)이고, 다른 하나는 ALTER 자신(12)이었다. `sql_kill_blocking_connection` 컬럼에도 `KILL 13`과 `KILL 12`가 함께 나온다. 줄을 막는 진짜 원인은 13인데, 뷰에 나온 KILL 문을 차례로 실행하면 ALTER까지 끊게 된다.
+
+#### LOCK=NONE이어도 끝에서 막힌다
+
+200만 행짜리 `big_orders` 테이블에 `ALGORITHM=INPLACE, LOCK=NONE`으로 인덱스를 만들었다. 이 인덱스는 만드는 데 3초 남짓 걸린다. 시작하고 0.3초 뒤에 트랜잭션 하나가 이 테이블을 읽고 8초에 커밋한다.
+
+|  | 문장 | 보낸 시각 | 기다린 시간 |
+| --- | --- | --- | --- |
+| E | SELECT | 0.6초 | 0.00초 |
+|  | UPDATE | 0.8초 | 0.03초 |
+|  | SELECT | 5.0초 | 3.01초 |
+|  | UPDATE | 5.2초 | 2.82초 |
+|  | ALTER (인덱스 추가) | 0초 | 8.01초 걸려 끝남 |
+
+인덱스를 만드는 동안에는 `LOCK=NONE`으로 기대한 대로 읽기와 쓰기가 막히지 않았다. 그런데 인덱스를 다 만든 뒤 커밋하려고 배타 락을 요청하는 순간, ALTER가 시작된 뒤에 열린 트랜잭션에 걸렸다. 그때부터 들어온 SELECT와 UPDATE는 다시 줄을 섰다. ALTER 전에 긴 트랜잭션이 없는지 확인해도, 작업이 오래 걸리면 그 사이에 열린 트랜잭션이 끝 단계를 막을 수 있다.
+
+#### 외래 키가 있으면 부모 테이블 쓰기도 멈춘다
+
+`children.parent_id`가 `parents.id`를 참조한다. 트랜잭션 하나가 `parents`의 한 행을 UPDATE하고 4초 동안 커밋하지 않는 동안, `children`에 INSTANT로 컬럼을 추가했다.
+
+|  | 문장 | 기다린 시간 |
+| --- | --- | --- |
+| F | `children`에 컬럼 추가 | 3.01초 |
+|  | `parents` 다른 행 SELECT | 0.00초 |
+|  | `parents` 다른 행 UPDATE | 1.81초 |
+|  | `children` SELECT | 1.61초 |
+
+메타데이터 락을 보니 `parents`를 UPDATE한 트랜잭션이 외래 키로 엮인 `children`의 공유 락(SHARED_READ)도 쥐고 있었다. 그래서 `children`의 ALTER가 기다렸고, 그 뒤에 온 `parents` UPDATE도 `children`의 공유 락을 얻으려다 ALTER 뒤에 줄을 섰다. 자식 테이블에 컬럼 하나 추가했을 뿐인데 부모 테이블의 쓰기가 멈췄다. 부모 테이블 읽기는 영향이 없었다.
+
+#### 200만 행에서 알고리즘별로
+
+ALTER를 하나씩 돌리는 동안 다른 세션이 10ms마다 무작위 행 UPDATE와 INSERT를 하나씩 보내고, 그 한 번에 걸린 시간을 쟀다. 실험 E에서 만든 인덱스가 남아 있어서 테이블에는 보조 인덱스가 둘 있다.
+
+|  | ALTER | 걸린 시간 | 동시 쓰기 최대 지연 | 행 버전 |
+| --- | --- | --- | --- | --- |
+| G1 | 컬럼 추가, `ALGORITHM=INSTANT` | 0.01초 | 8.1ms | 0 → 1 |
+| G2 | 컬럼 추가, `AFTER user_id`, `ALGORITHM=INSTANT` | 0.01초 | 4.4ms | 2 |
+| G3 | 컬럼 셋을 한 문장으로, `ALGORITHM=INSTANT` | 0.01초 | 10.6ms | 3 |
+| G4 | 컬럼 추가, `LOCK=NONE`만 (ALGORITHM 없음) | 0.01초 | 16.3ms | 4 |
+| G5 | 컬럼 추가, `ALGORITHM=INPLACE, LOCK=NONE` | 8.28초 | 130.5ms | 0 |
+| G6 | 컬럼 추가, `ALGORITHM=COPY` | 12.44초 | **12,445ms** | 0 |
+| G7 | 인덱스 추가, `ALGORITHM=INPLACE, LOCK=NONE` | 1.45초 | 22.5ms | 0 |
+| G8 | INT → BIGINT, `ALGORITHM=INSTANT` | 바로 ERROR 1846 | | |
+| G9 | INT → BIGINT, `ALGORITHM=INPLACE, LOCK=NONE` | 바로 ERROR 1846 | | |
+| G10 | INT → BIGINT, ALGORITHM 없음 | 14.37초 | **14,358ms** | 0 |
+
+G1과 G2는 테이블 크기와 상관없이 바로 끝났다. 8.4에서는 `AFTER`를 붙여도 INSTANT가 된다. G3은 컬럼 셋을 한 문장으로 추가해서 행 버전이 하나만 늘었다. G4는 `LOCK=NONE`만 적었는데 MySQL이 INSTANT를 골랐다. 컬럼 추가에서는 `LOCK=NONE`이 `ALGORITHM=INSTANT`와 함께 적었을 때만 문제가 된다. 타입 변경처럼 동시 쓰기를 허용하지 않는 작업은 `LOCK=NONE`만 적어도 거절된다.
+
+G5는 같은 컬럼 추가를 INPLACE로 강제한 것이다. 테이블을 다시 만들어 8.28초가 걸렸지만 그동안 쓰기는 계속됐다. 다시 만들면서 행 버전이 0으로 돌아갔다. G6의 COPY는 12.4초 동안 쓰기를 완전히 막았다.
+
+G8과 G9는 알고리즘을 적었더니 MySQL이 다른 알고리즘으로 넘어가지 않고 바로 거절했다(`Need to rebuild the table to change column type`, `Cannot change column type INPLACE. Try ALGORITHM=COPY.`). 아무것도 적지 않은 G10은 오류 없이 COPY로 돌았고, 그 14.4초 동안 쓰기가 멈췄다. ALGORITHM을 적으면 테이블을 막는 작업은 시작하기 전에 실패하고, 안 적으면 조용히 테이블을 막는다. 카카오 글이 ALGORITHM을 꼭 적으라고 한 것도 이 차이 때문이다.
+
+#### INSTANT의 한도와 VARCHAR 경계
+
+|  | 작업 | 결과 |
+| --- | --- | --- |
+| H1 | 컬럼 하나를 INSTANT로 추가하고 지우기를 반복 | 32쌍 뒤 행 버전 64. 다음 추가는 ERROR 4092 `Maximum row versions reached … Please use COPY/INPLACE.` |
+| H2 | 그 상태에서 ALGORITHM 없이 컬럼 추가 | 오류 없이 성공, 행 버전 0 (테이블을 다시 만듦) |
+| H3 | utf8mb4 `VARCHAR(50)` → `VARCHAR(63)`, INPLACE | 성공 (최대 252바이트) |
+| H4 | utf8mb4 `VARCHAR(63)` → `VARCHAR(64)`, INPLACE | ERROR 1846, COPY만 된다 (최대 256바이트) |
+| H5 | utf8mb4 `VARCHAR(255)` → `VARCHAR(300)`, INPLACE | 성공 |
+| H6 | VARCHAR 늘리기, INSTANT | ERROR 1845 |
+
+H2를 보면 64개를 다 쓴 테이블에서는 평소처럼 컬럼을 추가해도 아무 경고 없이 테이블 전체를 다시 만든다. 작은 테이블이면 모르고 지나가겠지만, 큰 테이블이면 G5처럼 몇 초에서 몇 분짜리 작업이 된다. 라라벨은 컬럼마다 ALTER를 따로 보내니(아래 I4) 행 버전을 컬럼 수만큼 쓴다.
+
+VARCHAR 경계는 글자 수가 아니라 바이트 수다. utf8mb4는 한 글자를 최대 4바이트로 잡아서 63자와 64자 사이에 경계가 있다. 라라벨 `string()`의 기본 길이 255자는 이미 256바이트를 넘으니, 거기서 더 늘리는 건 INPLACE로 된다.
+
+#### 라라벨 마이그레이션에서
+
+라라벨 문서의 예시를 따라 마이그레이션 하나에 컬럼 셋을 넣었다. 마지막 컬럼에 문서 예시와 같은 `->instant()->lock('none')`을 붙였다.
+
+```php
+Schema::table('orders', function (Blueprint $table) {
+    $table->string('coupon_code', 50)->nullable()->after('user_id')->instant();
+    $table->unsignedInteger('discount')->default(0)->instant();
+    $table->string('channel', 20)->nullable()->instant()->lock('none'); // 라라벨 문서의 예시와 같은 조합
+});
+```
+
+|  | 실행 | 결과 |
+| --- | --- | --- |
+| I1 | `migrate --pretend` | ALTER 세 문장. 첫 문장은 `add coupon_code … after user_id, algorithm=instant` |
+| I2 | `migrate` | 세 번째 문장에서 ERROR 1221 `Incorrect usage of ALGORITHM=INSTANT and LOCK=NONE/SHARED/EXCLUSIVE`. 이때 `coupon_code`와 `discount`는 이미 테이블에 들어가 있고, `migrations` 테이블에는 기록이 없다 |
+| I3 | 같은 마이그레이션을 다시 `migrate` | ERROR 1060 `Duplicate column name 'coupon_code'` |
+| I4 | 빈 테이블에 `instant()` 컬럼 셋을 `Schema::table()` 한 번으로 추가 | SQL 3개, 행 버전 3 |
+
+문서가 권하는 조합이 MySQL 8.4에서 오류가 났다. `after()`와 `instant()`는 문서와 달리 문제없이 됐다. 더 곤란한 건 I2의 뒤처리다. MySQL에서는 마이그레이션이 트랜잭션으로 묶이지 않으니, 앞의 두 ALTER는 이미 커밋된 채 남았다. 마이그레이션은 실행되지 않은 것으로 남아서, 고쳐서 다시 돌려도 I3처럼 첫 문장에서 막힌다. 손으로 컬럼을 지우거나 마이그레이션을 고쳐 써야 한다.
+
+#### 여러 서버가 동시에 migrate하면
+
+배포할 때 서버마다 `migrate`를 돌리는 상황이다. 5초짜리 트랜잭션이 `orders`를 잡고 있는 동안, 컬럼 하나를 추가하는 같은 마이그레이션을 0.5초 간격으로 두 번 실행했다.
+
+|  | 옵션 | 첫 번째 | 두 번째 |
+| --- | --- | --- | --- |
+| J1 | 없음 | 4초 기다린 뒤 성공, 종료 코드 0 | 3초 기다린 뒤 ERROR 1060(중복 컬럼), 종료 코드 1 |
+| J2 | `--isolated` | 4초 기다린 뒤 성공, 종료 코드 0 | 1.1초에 `The [migrate] command is already running.`, 종료 코드 0 |
+| J3 | `--isolated=75` | 같음 | 1.1초에 같은 메시지, 종료 코드 75 |
+
+J1에서는 둘 다 메타데이터 락을 기다렸다가, 늦게 들어간 쪽이 이미 추가된 컬럼에 부딪혀 실패했다. 배포 하나가 실패로 표시된다. J2의 `--isolated`는 두 번째 실행을 막았지만, 두 번째는 첫 번째가 끝나기를 기다리지 않고 4초 먼저 성공 코드로 끝났다. 배포 스크립트가 `migrate` 성공을 '스키마 준비 완료'로 보고 다음 단계로 넘어가면, 그 서버는 아직 컬럼이 없는 테이블에서 새 코드를 띄운다. J3처럼 종료 코드를 바꾸면 스크립트가 '내가 실행하지 않았다'는 걸 구분할 수 있다.
+
+#### 배포 중 옛 코드가 만나는 오류
+
+롤링 배포 중에는 옛 코드가 새 스키마에서 잠깐 돈다. 옛 코드의 INSERT를 흉내 냈다.
+
+|  | 마이그레이션 | 옛 코드의 `INSERT INTO orders (user_id, status, amount) …` |
+| --- | --- | --- |
+| K1 | `currency CHAR(3) NOT NULL` 추가 (기본값 없음) | ERROR 1364 `Field 'currency' doesn't have a default value` |
+| K2 | `amount` → `total` 이름 변경 | ERROR 1054 `Unknown column 'amount' in 'field list'` |
+
+MySQL 8.4 기본 설정은 strict 모드(`STRICT_TRANS_TABLES`)라 K1이 경고가 아니라 오류다. 라라벨 `string()`, `integer()` 같은 컬럼은 `nullable()`이나 `default()`를 안 붙이면 NOT NULL에 기본값이 없다. 컬럼 이름 바꾸기는 8.4에서 INSTANT라 DB 쪽에서는 0.01초짜리 작업이지만, K2처럼 옛 코드를 바로 깨뜨린다. 문제는 락이 아니라 코드와 스키마의 호환성이다.
+
+#### 백필을 한 문장으로 할 때와 나눠서 할 때
+
+200만 행에 새 컬럼을 추가하고 기존 값을 복사했다. 그동안 다른 세션이 20ms마다 무작위 행 하나를 UPDATE했다.
+
+|  | 백필 방법 | 걸린 시간 | 동시 UPDATE 최대 지연 |
+| --- | --- | --- | --- |
+| L1 | `UPDATE big_orders SET amount_copy = amount` 한 문장 | 17.28초 | **16,074ms** |
+| L2 | `chunkById(1000)`으로 1000건씩 나눠서 | 23.38초 | 2.0ms |
+
+L1은 한 문장이 끝날 때까지 고친 행의 잠금을 쥔다. 이번에는 16초를 기다렸다가 처리됐지만, 테이블이 더 커서 50초(`innodb_lock_wait_timeout`)를 넘겼다면 1205로 실패했을 것이다. 이건 메타데이터 락이 아니라 행 잠금이다. L2는 더 오래 걸렸지만 묶음마다 커밋하니 다른 요청이 거의 기다리지 않았다. 이 UPDATE를 마이그레이션의 `up()`에 넣으면 L1이 배포 중에 돈다.
+
+#### gh-ost로 타입을 바꾸면
+
+G10처럼 COPY만 되는 변경을 gh-ost로 해 봤다. gh-ost는 새 테이블을 만들어 조금씩 복사하고 binlog로 변경분을 따라잡은 뒤, 마지막에 두 테이블 이름을 맞바꾼다(cut-over).
+
+|  | 상황 | 전체 시간 | 동시 UPDATE 최대 지연 | cut-over 로그 |
+| --- | --- | --- | --- | --- |
+| M1 | 200만 행 `amount` 타입 변경 | 27.4초 | 992ms | `Lock & rename duration: 1.001952917s` |
+| M2 | 복사가 끝난 뒤 12초짜리 트랜잭션을 열고 cut-over | | **5,998ms** | 첫 시도는 6초 기다린 뒤 1205, 두 번째 시도에서 `Lock & rename duration: 4.005555211s` |
+
+M1은 COPY(G10)보다 두 배 가까이 걸렸지만 그동안 쓰기는 거의 막히지 않았다. 막힌 건 cut-over의 1초뿐이다. M2는 Percona 글과 같은 장면이다. gh-ost도 마지막에는 원본 테이블을 잠가야 해서 열린 트랜잭션을 기다렸고, 그동안 앱의 쓰기가 6초 가까이 멈췄다. gh-ost는 cut-over 때 잠금을 쥐는 최대 시간이 기본 3초(`--cut-over-lock-timeout-seconds`)이고, 넘기면 다시 시도한다. 이번 로그에는 잠금을 6초까지 기다리도록 잡았다고(`Setting LOCK timeout as 6 seconds`) 찍혔다. 도구를 써도 열린 트랜잭션 문제는 그대로 남는다.
+
+<details>
+<summary>실험 코드와 돌리는 법</summary>
+
+빈 폴더에 아래 파일을 만들고 맨 아래 명령을 차례로 돌리면 된다. `lab/`으로 시작하는 파일은 라라벨 새 프로젝트를 만든 뒤에 넣는다. 새 프로젝트에는 그날의 최신 13.x가 설치된다(이 글은 13.43.0에서 돌렸다).
+
+```dockerfile title="Dockerfile"
+FROM php:8.3-cli
+RUN apt-get update && apt-get install -y --no-install-recommends unzip curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && docker-php-ext-install pdo_mysql pcntl
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+```
+
+```yaml title="compose.yaml"
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: lab
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 2s
+      retries: 30
+  app:
+    build: .
+    working_dir: /work/lab
+    volumes: [".:/work"]
+    environment:
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_DATABASE: lab
+      DB_USERNAME: root
+      DB_PASSWORD: ""
+    depends_on:
+      mysql: { condition: service_healthy }
+```
+
+```php title="setup.php"
+<?php
+// 실험용 테이블을 새로 만든다. big_orders는 200만 행.
+$db = new PDO('mysql:host=mysql;dbname=lab', 'root', '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+$db->exec('DROP TABLE IF EXISTS orders, big_orders, children, parents, rv');
+$db->exec("CREATE TABLE orders (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, user_id BIGINT UNSIGNED NOT NULL,
+    status VARCHAR(20) NOT NULL, amount INT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+$db->exec("INSERT INTO orders (user_id, status, amount) VALUES (1, 'paid', 1000), (2, 'paid', 2000), (3, 'ready', 3000)");
+$db->exec("CREATE TABLE big_orders (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, user_id BIGINT UNSIGNED NOT NULL,
+    status VARCHAR(20) NOT NULL, amount INT NOT NULL, note VARCHAR(50) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY idx_user (user_id))");
+$db->exec('SET SESSION cte_max_recursion_depth = 2000000');
+$db->exec("INSERT INTO big_orders (user_id, status, amount, note)
+    WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 2000000)
+    SELECT n % 100000, ELT(1 + n % 3, 'ready', 'paid', 'canceled'), n % 50000, REPEAT('x', 30) FROM seq");
+$db->exec('CREATE TABLE parents (id INT PRIMARY KEY, name VARCHAR(20))');
+$db->exec('CREATE TABLE children (id INT PRIMARY KEY, parent_id INT, FOREIGN KEY (parent_id) REFERENCES parents (id))');
+$db->exec("INSERT INTO parents VALUES (1, 'a'), (2, 'b')");
+$db->exec('INSERT INTO children VALUES (1, 1)');
+echo "테이블 준비 끝: big_orders ".$db->query('SELECT COUNT(*) FROM big_orders')->fetchColumn()."행\n";
+```
+
+```php title="sessions.php"
+<?php
+// 세션 여러 개를 시간차로 띄워 문장마다 언제 끝났고 얼마나 기다렸는지 찍는다.
+// 사용: php sessions.php <시나리오 이름>  (시나리오는 scenarios.php)
+
+$name = $argv[1];
+$scenario = (require __DIR__.'/scenarios.php')[$name];
+$t0 = microtime(true) + 0.3;
+
+function db(): PDO
+{
+    return new PDO('mysql:host=mysql;dbname=lab', 'root', '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+}
+
+function at(float $t0, float $sec): void
+{
+    $wait = $t0 + $sec - microtime(true);
+    if ($wait > 0) {
+        usleep((int) ($wait * 1e6));
+    }
+}
+
+function say(float $t0, string $who, string $msg): void
+{
+    printf("%5.2f초  %-7s %s\n", microtime(true) - $t0, $who, $msg);
+}
+
+function short(string $sql): string
+{
+    return mb_strimwidth($sql, 0, 58, '…');
+}
+
+echo "== $name\n";
+$pids = [];
+foreach ($scenario['sessions'] as $who => $steps) {
+    if (($pid = pcntl_fork()) === 0) {
+        $db = db();
+        foreach ($steps as [$sec, $sql]) {
+            at($t0, $sec);
+            if (is_array($sql)) { // ['retry', SQL, 타임아웃 초, 쉬는 초]
+                [, $sql, $timeout, $pause] = $sql;
+                $db->exec("SET SESSION lock_wait_timeout = $timeout");
+                for ($try = 1; ; $try++) {
+                    $s = microtime(true);
+                    try {
+                        $db->exec($sql);
+                        say($t0, $who, sprintf('%d번째 시도 성공 (%.2f초)', $try, microtime(true) - $s));
+                        break;
+                    } catch (PDOException $e) {
+                        say($t0, $who, sprintf('%d번째 시도 %s (%.2f초), %d초 쉬고 다시', $try, $e->errorInfo[1], microtime(true) - $s, $pause));
+                        sleep($pause);
+                    }
+                }
+                continue;
+            }
+            $s = microtime(true);
+            try {
+                $st = $db->query($sql);
+                $result = $st->columnCount() ? count($st->fetchAll()).'행' : 'OK';
+            } catch (PDOException $e) {
+                $result = 'ERROR '.$e->errorInfo[1];
+            }
+            say($t0, $who, sprintf('%-58s → %s, %.2f초', short($sql), $result, microtime(true) - $s));
+        }
+        exit(0);
+    }
+    $pids[] = $pid;
+}
+
+// 정해진 시각에 메타데이터 락을 찍는다.
+foreach ($scenario['watch'] ?? [] as $sec) {
+    at($t0, $sec);
+    say($t0, 'watch', 'performance_schema.metadata_locks');
+    $rows = db()->query("
+        SELECT t.PROCESSLIST_ID id, ml.OBJECT_NAME tbl, ml.LOCK_TYPE type, ml.LOCK_STATUS status,
+               IFNULL(t.PROCESSLIST_STATE, '') state, IFNULL(LEFT(t.PROCESSLIST_INFO, 30), '(열린 트랜잭션)') info
+        FROM performance_schema.metadata_locks ml
+        JOIN performance_schema.threads t ON t.THREAD_ID = ml.OWNER_THREAD_ID
+        WHERE ml.OBJECT_SCHEMA = 'lab' AND ml.OBJECT_TYPE = 'TABLE' AND ml.OBJECT_NAME NOT LIKE '#sql%'
+        ORDER BY t.PROCESSLIST_ID, ml.LOCK_STATUS")->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($rows as $r) {
+        printf("         %-4s %-8s %-17s %-8s %-31s %s\n", $r['id'], $r['tbl'], $r['type'], $r['status'], $r['state'], $r['info']);
+    }
+}
+foreach ($scenario['sys'] ?? [] as $sec) {
+    at($t0, $sec);
+    say($t0, 'watch', 'sys.schema_table_lock_waits');
+    foreach (db()->query('SELECT waiting_pid, blocking_pid, blocking_lock_type, sql_kill_blocking_connection FROM sys.schema_table_lock_waits') as $r) {
+        printf("         waiting %s ← blocking %s %-17s %s\n", $r['waiting_pid'], $r['blocking_pid'], $r['blocking_lock_type'], $r['sql_kill_blocking_connection']);
+    }
+}
+foreach ($pids as $pid) {
+    pcntl_waitpid($pid, $status);
+}
+```
+
+```php title="scenarios.php"
+<?php
+// [시작 초, SQL] 목록. 'tx'는 트랜잭션을 열고 한 번 읽은 뒤 커밋하지 않고 버틴다.
+$reads = [];
+foreach ([1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5] as $sec) {
+    $reads[] = [$sec, 'SELECT * FROM orders WHERE id = 2'];
+}
+
+return [
+    'A' => [ // 읽기만 한 트랜잭션이 열려 있을 때 INSTANT 컬럼 추가
+        'sessions' => [
+            'tx'    => [[0, 'BEGIN'], [0, 'SELECT * FROM orders WHERE id = 1'], [5, 'COMMIT']],
+            'alter' => [[1, 'ALTER TABLE orders ADD COLUMN memo_a VARCHAR(100) NULL, ALGORITHM=INSTANT']],
+            'read'  => [[2, 'SELECT * FROM orders WHERE id = 2']],
+            'write' => [[2.5, 'UPDATE orders SET amount = amount + 1 WHERE id = 3']],
+        ],
+        'watch' => [3],
+        'sys'   => [3.3],
+    ],
+    'B' => [ // 트랜잭션 없이 4초 걸리는 SELECT 하나
+        'sessions' => [
+            'report' => [[0, 'SELECT id, SLEEP(4) FROM orders WHERE id = 1']],
+            'alter'  => [[0.5, 'ALTER TABLE orders ADD COLUMN memo_b VARCHAR(100) NULL, ALGORITHM=INSTANT']],
+            'read'   => [[1, 'SELECT * FROM orders WHERE id = 2']],
+        ],
+    ],
+    'C' => [ // A와 같은데 ALTER 세션만 lock_wait_timeout = 3
+        'sessions' => [
+            'tx'    => [[0, 'BEGIN'], [0, 'SELECT * FROM orders WHERE id = 1'], [8, 'COMMIT']],
+            'alter' => [[1, 'SET SESSION lock_wait_timeout = 3'], [1, 'ALTER TABLE orders ADD COLUMN memo_c VARCHAR(100) NULL, ALGORITHM=INSTANT']],
+            'read'  => [[2, 'SELECT * FROM orders WHERE id = 2'], [5, 'SELECT * FROM orders WHERE id = 2']],
+        ],
+    ],
+    'D' => [ // 7초짜리 트랜잭션 동안 lock_wait_timeout 1초로 ALTER를 다시 시도
+        'sessions' => [
+            'tx'    => [[0, 'BEGIN'], [0, 'SELECT * FROM orders WHERE id = 1'], [7, 'COMMIT']],
+            'alter' => [[1, ['retry', 'ALTER TABLE orders ADD COLUMN memo_d VARCHAR(100) NULL, ALGORITHM=INSTANT', 1, 2]]],
+            'read'  => $reads,
+        ],
+    ],
+    'E' => [ // 200만 행 테이블에 LOCK=NONE 인덱스(만드는 데 3초 남짓)를 만드는 도중 트랜잭션이 시작되면
+        'sessions' => [
+            'alter'  => [[0, 'ALTER TABLE big_orders ADD INDEX idx_note (note, status, amount), ALGORITHM=INPLACE, LOCK=NONE']],
+            'tx'     => [[0.3, 'BEGIN'], [0.3, 'SELECT id FROM big_orders WHERE id = 1'], [8, 'COMMIT']],
+            'read1'  => [[0.6, 'SELECT id FROM big_orders WHERE id = 2']],
+            'write1' => [[0.8, 'UPDATE big_orders SET amount = 1 WHERE id = 4']],
+            'read2'  => [[5, 'SELECT id FROM big_orders WHERE id = 3']],
+            'write2' => [[5.2, 'UPDATE big_orders SET amount = 1 WHERE id = 5']],
+        ],
+    ],
+    'F' => [ // 부모 테이블에 쓰기 트랜잭션이 열린 동안 자식 테이블에 INSTANT 컬럼 추가
+        'sessions' => [
+            'tx'     => [[0, 'BEGIN'], [0, "UPDATE parents SET name = 'x' WHERE id = 2"], [4, 'COMMIT']],
+            'alter'  => [[1, 'ALTER TABLE children ADD COLUMN memo VARCHAR(20) NULL, ALGORITHM=INSTANT']],
+            'pread'  => [[2, 'SELECT * FROM parents WHERE id = 1']],
+            'pwrite' => [[2.2, "UPDATE parents SET name = 'y' WHERE id = 1"]],
+            'cread'  => [[2.4, 'SELECT * FROM children WHERE id = 1']],
+        ],
+        'watch' => [3],
+    ],
+];
+```
+
+```php title="ddl.php"
+<?php
+// big_orders에 ALTER를 하나씩 돌리는 동안 다른 세션이 10ms마다 UPDATE와 INSERT를 하고 지연을 잰다.
+$pdo = fn () => new PDO('mysql:host=mysql;dbname=lab', 'root', '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+$versions = fn () => $pdo()->query("SELECT TOTAL_ROW_VERSIONS FROM information_schema.INNODB_TABLES WHERE NAME = 'lab/big_orders'")->fetchColumn();
+
+foreach (array_slice($argv, 1) as $alter) {
+    $flag = '/tmp/ddl-done';
+    @unlink($flag);
+    if (($pid = pcntl_fork()) === 0) {
+        $db = $pdo();
+        $lat = [];
+        while (! file_exists($flag)) {
+            $s = microtime(true);
+            $db->exec('UPDATE big_orders SET amount = amount + 1 WHERE id = '.random_int(1, 2000000));
+            $db->exec("INSERT INTO big_orders (user_id, status, amount) VALUES (1, 'ready', 1)");
+            $lat[] = (microtime(true) - $s) * 1000;
+            usleep(10000);
+        }
+        sort($lat);
+        printf("   동시 쓰기 %d회, 중앙값 %.1fms, 최대 %.1fms\n", count($lat), $lat[intdiv(count($lat), 2)], end($lat));
+        exit(0);
+    }
+    usleep(500000);
+    $s = microtime(true);
+    try {
+        $pdo()->exec($alter);
+        $result = sprintf('%.2f초', microtime(true) - $s);
+    } catch (PDOException $e) {
+        $result = 'ERROR '.$e->errorInfo[1].' '.$e->errorInfo[2];
+    }
+    printf("%s\n   → %s, 행 버전 %s\n", $alter, $result, $versions());
+    usleep(500000);
+    touch($flag);
+    pcntl_waitpid($pid, $st);
+}
+```
+
+```php title="versions.php"
+<?php
+// INSTANT 행 버전 한도, utf8mb4 VARCHAR 경계, 배포 중 옛 코드가 만나는 오류
+$db = new PDO('mysql:host=mysql;dbname=lab', 'root', '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+$try = function (string $sql) use ($db): string {
+    try {
+        $db->exec($sql);
+        return 'OK';
+    } catch (PDOException $e) {
+        return 'ERROR '.$e->errorInfo[1].' '.$e->errorInfo[2];
+    }
+};
+$v = fn () => $db->query("SELECT TOTAL_ROW_VERSIONS FROM information_schema.INNODB_TABLES WHERE NAME = 'lab/rv'")->fetchColumn();
+
+echo "== 행 버전 한도\n";
+$db->exec('CREATE TABLE rv (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL, memo VARCHAR(255) NULL)');
+for ($i = 1; ; $i++) {
+    $r = $try("ALTER TABLE rv ADD COLUMN c$i INT, ALGORITHM=INSTANT");
+    if ($r !== 'OK') {
+        echo "INSTANT 추가·삭제 ".($i - 1)."쌍 뒤 행 버전 {$v()}, 다음 추가: $r\n";
+        break;
+    }
+    $try("ALTER TABLE rv DROP COLUMN c$i, ALGORITHM=INSTANT");
+}
+$try('ALTER TABLE rv ADD COLUMN z INT');
+echo "ALGORITHM 없이 컬럼 추가 → 행 버전 {$v()}\n";
+
+echo "== VARCHAR 늘리기 (utf8mb4, 글자당 최대 4바이트)\n";
+foreach (['name VARCHAR(63) NOT NULL', 'name VARCHAR(64) NOT NULL', 'memo VARCHAR(300) NULL'] as $col) {
+    echo "MODIFY $col, INPLACE → ".$try("ALTER TABLE rv MODIFY $col, ALGORITHM=INPLACE, LOCK=NONE")."\n";
+}
+echo 'MODIFY memo VARCHAR(400) NULL, INSTANT → '.$try('ALTER TABLE rv MODIFY memo VARCHAR(400) NULL, ALGORITHM=INSTANT')."\n";
+
+echo "== 옛 코드가 쓰는 INSERT\n";
+$old = "INSERT INTO orders (user_id, status, amount) VALUES (9, 'ready', 100)";
+$try('ALTER TABLE orders ADD COLUMN currency CHAR(3) NOT NULL');
+echo "NOT NULL·기본값 없는 컬럼 추가 뒤 → ".$try($old)."\n";
+$try('ALTER TABLE orders DROP COLUMN currency');
+$try('ALTER TABLE orders RENAME COLUMN amount TO total');
+echo "amount → total 이름 변경 뒤 → ".$try($old)."\n";
+$try('ALTER TABLE orders RENAME COLUMN total TO amount');
+```
+
+```php title="writer.php"
+<?php
+// 플래그 파일이 생길 때까지 20ms마다 big_orders의 아무 행 하나를 고치고 지연을 잰다.
+$db = new PDO('mysql:host=mysql;dbname=lab', 'root', '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+$lat = [];
+while (! file_exists($argv[1])) {
+    $s = microtime(true);
+    $db->exec('UPDATE big_orders SET status = status WHERE id = '.random_int(1, 2000000));
+    $lat[] = (microtime(true) - $s) * 1000;
+    usleep(20000);
+}
+sort($lat);
+printf("   동시 UPDATE %d회, 중앙값 %.1fms, 최대 %.1fms\n", count($lat), $lat[intdiv(count($lat), 2)], end($lat));
+```
+
+```php title="hold.php"
+<?php
+// 트랜잭션을 열고 orders를 한 번 읽은 뒤 N초 동안 커밋하지 않는다.
+$db = new PDO('mysql:host=mysql;dbname=lab', 'root', '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+$db->beginTransaction();
+$db->query('SELECT * FROM orders WHERE id = 1')->fetchAll();
+sleep((int) $argv[1]);
+$db->commit();
+```
+
+```php title="lab/database/lab-migrations/2026_11_24_000001_add_columns_to_orders.php"
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('orders', function (Blueprint $table) {
+            $table->string('coupon_code', 50)->nullable()->after('user_id')->instant();
+            $table->unsignedInteger('discount')->default(0)->instant();
+            $table->string('channel', 20)->nullable()->instant()->lock('none'); // 라라벨 문서의 예시와 같은 조합
+        });
+    }
+};
+```
+
+```php title="lab/database/lab-migrations/2026_11_24_000002_add_ref_no_to_orders.php"
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('orders', function (Blueprint $table) {
+            $table->string('ref_no', 30)->nullable()->instant();
+        });
+    }
+};
+```
+
+```php title="lab/routes/console.php"
+<?php
+
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+// 새 컬럼 채우기: single은 UPDATE 한 문장, chunk는 1000건씩 나눠서 커밋
+Artisan::command('lab:backfill {mode}', function (string $mode) {
+    $s = microtime(true);
+    if ($mode === 'single') {
+        DB::table('big_orders')->update(['amount_copy' => DB::raw('amount')]);
+    } else {
+        DB::table('big_orders')->whereNull('amount_copy')->select('id')
+            ->chunkById(1000, function ($rows) {
+                DB::table('big_orders')
+                    ->whereBetween('id', [$rows->first()->id, $rows->last()->id])
+                    ->whereNull('amount_copy')
+                    ->update(['amount_copy' => DB::raw('amount')]);
+            });
+    }
+    $this->line(sprintf('백필(%s) %.2f초', $mode, microtime(true) - $s));
+});
+
+// Schema::table 한 번에 instant 컬럼 세 개를 추가하면 행 버전이 몇 개 느는지
+Artisan::command('lab:instant-columns', function () {
+    Schema::dropIfExists('rv2');
+    Schema::create('rv2', fn (Blueprint $table) => $table->id());
+    $sql = DB::pretend(fn () => Schema::table('rv2', function (Blueprint $table) {
+        $table->string('a')->nullable()->instant();
+        $table->string('b')->nullable()->instant();
+        $table->string('c')->nullable()->instant();
+    }));
+    $this->line('만들어지는 SQL '.count($sql).'개');
+    Schema::table('rv2', function (Blueprint $table) {
+        $table->string('a')->nullable()->instant();
+        $table->string('b')->nullable()->instant();
+        $table->string('c')->nullable()->instant();
+    });
+    $versions = DB::scalar("SELECT TOTAL_ROW_VERSIONS FROM information_schema.INNODB_TABLES WHERE NAME = 'lab/rv2'");
+    $this->line("instant 컬럼 3개 추가 뒤 행 버전 $versions");
+});
+```
+
+```bash title="run.sh"
+#!/bin/bash
+# docker compose run --rm app bash ../run.sh
+cd /work
+php setup.php
+
+echo "== 1. 메타데이터 락 줄서기"
+for s in A B C D E F; do php sessions.php $s; done
+
+echo "== 2. 200만 행에서 알고리즘별 시간과 동시 쓰기"
+php ddl.php \
+  "ALTER TABLE big_orders ADD COLUMN c1 VARCHAR(100) NULL, ALGORITHM=INSTANT" \
+  "ALTER TABLE big_orders ADD COLUMN c2 VARCHAR(100) NULL AFTER user_id, ALGORITHM=INSTANT" \
+  "ALTER TABLE big_orders ADD COLUMN c3 INT NULL, ADD COLUMN c4 INT NULL, ADD COLUMN c5 INT NULL, ALGORITHM=INSTANT" \
+  "ALTER TABLE big_orders ADD COLUMN c6 INT NULL, LOCK=NONE" \
+  "ALTER TABLE big_orders ADD COLUMN c7 VARCHAR(100) NULL, ALGORITHM=INPLACE, LOCK=NONE" \
+  "ALTER TABLE big_orders ADD COLUMN c8 VARCHAR(100) NULL, ALGORITHM=COPY" \
+  "ALTER TABLE big_orders ADD INDEX idx_status (status), ALGORITHM=INPLACE, LOCK=NONE" \
+  "ALTER TABLE big_orders MODIFY amount BIGINT NOT NULL, ALGORITHM=INSTANT" \
+  "ALTER TABLE big_orders MODIFY amount BIGINT NOT NULL, ALGORITHM=INPLACE, LOCK=NONE" \
+  "ALTER TABLE big_orders MODIFY amount BIGINT NOT NULL"
+php versions.php
+
+echo "== 3. 라라벨 마이그레이션"
+cd /work/lab
+php artisan migrate --force -q
+M=database/lab-migrations
+php artisan migrate --force --pretend --path=$M/2026_11_24_000001_add_columns_to_orders.php
+php artisan migrate --force --path=$M/2026_11_24_000001_add_columns_to_orders.php 2>&1 | grep -E 'FAIL|SQLSTATE'
+php -r '$d = new PDO("mysql:host=mysql;dbname=lab", "root", ""); echo "orders 컬럼: ", implode(", ", $d->query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = \"lab\" AND TABLE_NAME = \"orders\" ORDER BY ORDINAL_POSITION")->fetchAll(PDO::FETCH_COLUMN)), "\n";'
+echo "-- 같은 마이그레이션을 다시 돌리면"
+php artisan migrate --force --path=$M/2026_11_24_000001_add_columns_to_orders.php 2>&1 | grep -E 'FAIL|SQLSTATE'
+php artisan lab:instant-columns
+
+two_migrations() { # 5초짜리 트랜잭션이 열린 동안 migrate 두 개를 0.5초 간격으로
+  php -r '$d = new PDO("mysql:host=mysql;dbname=lab", "root", ""); try { $d->exec("ALTER TABLE orders DROP COLUMN ref_no"); } catch (PDOException) {}'
+  php artisan migrate:rollback --force --path=$M/2026_11_24_000002_add_ref_no_to_orders.php -q 2>/dev/null
+  start=$(php -r "echo microtime(true);")
+  php ../hold.php 5 & sleep 0.5
+  for w in 1 2; do
+    ( out=$(php artisan migrate --force --path=$M/2026_11_24_000002_add_ref_no_to_orders.php $1 2>&1); code=$?
+      echo "$out" | grep -E 'DONE|FAIL|SQLSTATE|already' | sed "s/^/   [$w] /"
+      echo "   [$w] 종료 코드 $code, $(php -r "printf('%.1f', microtime(true) - $start);")초에 끝남" ) &
+    sleep 0.5
+  done
+  wait
+}
+echo "-- --isolated 없이";    two_migrations ""
+echo "-- --isolated";         two_migrations --isolated
+echo "-- --isolated=75";      two_migrations --isolated=75
+
+echo "== 4. 백필"
+cd /work
+php -r '$d = new PDO("mysql:host=mysql;dbname=lab", "root", ""); $d->exec("ALTER TABLE big_orders ADD COLUMN amount_copy BIGINT NULL");'
+for mode in single chunk; do
+  php -r '$d = new PDO("mysql:host=mysql;dbname=lab", "root", ""); $d->exec("UPDATE big_orders SET amount_copy = NULL");'
+  rm -f /tmp/writer-done
+  php writer.php /tmp/writer-done & sleep 0.5
+  (cd lab && php artisan lab:backfill $mode)
+  sleep 0.3; touch /tmp/writer-done; wait
+done
+```
+
+```bash title="ghost.sh"
+#!/bin/bash
+# docker compose run --rm app bash ../ghost.sh   (run.sh 다음에 돌린다)
+cd /work
+arch=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+if [ ! -x /tmp/gh-ost ]; then
+  curl -sL https://github.com/github/gh-ost/releases/download/v1.1.11/gh-ost-linux-$arch.tar.gz | tar xz -C /tmp gh-ost
+fi
+ghost() { # $1: ALTER 내용, 나머지: 추가 옵션
+  alter=$1; shift
+  /tmp/gh-ost --host=mysql --user=root --password= --database=lab --table=big_orders --alter="$alter" \
+    --allow-on-master --assume-rbr --chunk-size=1000 --exact-rowcount=false \
+    --initially-drop-ghost-table --initially-drop-old-table --ok-to-drop-table --verbose --execute "$@" > /tmp/ghost.log 2>&1
+  grep -E "Setting LOCK timeout|Locking|Tables locked|Error 1205|Lock & rename duration" /tmp/ghost.log | sed 's/^/   /'
+}
+
+echo "== gh-ost로 amount를 BIGINT → INT, 동시 쓰기"
+rm -f /tmp/writer-done; php writer.php /tmp/writer-done & sleep 0.5
+start=$(php -r 'echo microtime(true);')
+ghost "MODIFY amount INT NOT NULL"
+echo "   gh-ost 전체 $(php -r "printf('%.1f', microtime(true) - $start);")초"
+touch /tmp/writer-done; wait
+
+echo "== 다시 INT → BIGINT. 복사가 끝난 뒤 12초짜리 트랜잭션을 열고 cut-over를 허용"
+touch /tmp/ghost.postpone
+ghost "MODIFY amount BIGINT NOT NULL" --postpone-cut-over-flag-file=/tmp/ghost.postpone &
+G=$!
+while ! grep -q "postponing cut-over" /tmp/ghost.log 2>/dev/null; do sleep 1; done
+php -r '$d = new PDO("mysql:host=mysql;dbname=lab", "root", ""); $d->beginTransaction(); $d->query("SELECT id FROM big_orders WHERE id = 1")->fetchAll(); sleep(12); $d->commit();' &
+sleep 0.5
+rm -f /tmp/writer-done; php writer.php /tmp/writer-done &
+rm /tmp/ghost.postpone
+wait $G
+touch /tmp/writer-done; wait
+```
+
+```bash title="돌리는 법"
+docker compose build
+docker compose run --rm --no-deps -w /work app composer create-project laravel/laravel lab "^13.0"
+# 끝에 mysql 접속 경고가 나와도 괜찮다(설치 스크립트의 migrate --graceful)
+# 리눅스에서 lab/이 root 소유로 만들어졌다면: sudo chown -R "$(id -u):$(id -g)" lab
+# 여기서 lab/ 아래 파일 세 개를 넣는다(database/lab-migrations 폴더는 새로 만든다)
+docker compose run --rm app bash ../run.sh
+docker compose run --rm app bash ../ghost.sh
+docker compose down -v
+```
+
+숫자는 기기마다 조금씩 다르게 나온다.
+
+</details>
+
+## 2. 우리 프로젝트에 적용한다면
+
+### 마이그레이션 전에 그 테이블을 잡고 있는 세션부터 본다
+
+실험 A, E, M2는 모두 열린 트랜잭션 하나에서 시작했다. 바꿀 테이블에 메타데이터 락을 쥔 세션과, 그 세션의 트랜잭션이 열린 지 몇 초인지는 이렇게 본다.
+
+```sql
+SELECT t.PROCESSLIST_ID AS id, ml.LOCK_TYPE AS lock_type,
+       TIMESTAMPDIFF(SECOND, trx.trx_started, NOW()) AS trx_seconds,
+       t.PROCESSLIST_COMMAND AS command, LEFT(t.PROCESSLIST_INFO, 60) AS query
+FROM performance_schema.metadata_locks ml
+JOIN performance_schema.threads t ON t.THREAD_ID = ml.OWNER_THREAD_ID
+LEFT JOIN information_schema.INNODB_TRX trx ON trx.trx_mysql_thread_id = t.PROCESSLIST_ID
+WHERE ml.OBJECT_SCHEMA = DATABASE() AND ml.OBJECT_NAME = 'orders'
+  AND ml.LOCK_STATUS = 'GRANTED' AND t.PROCESSLIST_ID <> CONNECTION_ID();
+```
+
+`command`가 `Sleep`인데 `trx_seconds`가 큰 세션이 실험 A의 tx 같은 경우다. 쿼리는 안 돌고 있지만 트랜잭션을 열어 둔 채 쉬고 있다. 예외로 트랜잭션을 닫지 못한 큐 워커가 그대로 살아 있을 때, 누군가 DB 클라이언트에서 트랜잭션을 열어 두었을 때 이런 세션이 생긴다. 오래 도는 분석용 쿼리도 실험 B처럼 같은 일을 한다. 이미 막혔을 때는 `sys.schema_table_lock_waits`로 막는 세션을 찾되, 실험 A에서 봤듯이 ALTER 자신도 막는 세션으로 나오니 `blocking_pid`가 ALTER가 아닌지 보고 끊는다.
+
+배포 시간에 맞춰 이 쿼리를 보는 것과 별개로, 평소에 오래 열린 트랜잭션을 알리는 감시가 있으면 좋다. Ninon의 글에서도 범인은 몇 시간째 열려 있던 트랜잭션이었다.
+
+### ALTER 세션에는 짧은 대기 시간과 재시도를 건다
+
+`lock_wait_timeout` 기본값은 1년이다. 마이그레이션이 열린 트랜잭션에 걸리면 그 트랜잭션이 끝날 때까지 테이블 전체가 줄을 선다(실험 A). 마이그레이션을 돌리는 세션에만 이 값을 몇 초로 낮추고, 실패하면 쉬었다가 다시 시도한다(실험 D).
+
+```php title="app/Support/Ddl.php"
+<?php
+
+namespace App\Support;
+
+use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\DB;
+
+class Ddl
+{
+    /**
+     * ALTER 한 문장을 짧은 메타데이터 락 대기로 실행하고, 못 잡으면 쉬었다가 다시 시도한다.
+     */
+    public static function withRetry(callable $alter, int $timeout = 2, int $tries = 5, int $pause = 5): void
+    {
+        $db = DB::connection();
+        $before = $db->scalar('SELECT @@SESSION.lock_wait_timeout');
+        $db->statement("SET SESSION lock_wait_timeout = $timeout");
+
+        try {
+            for ($try = 1; ; $try++) {
+                try {
+                    $alter();
+
+                    return;
+                } catch (QueryException $e) {
+                    if (($e->errorInfo[1] ?? null) !== 1205 || $try >= $tries) {
+                        throw $e;
+                    }
+                    logger()->warning("메타데이터 락을 {$timeout}초 안에 못 잡음, {$pause}초 뒤 다시 ({$try}/{$tries})");
+                    sleep($pause);
+                }
+            }
+        } finally {
+            $db->statement("SET SESSION lock_wait_timeout = $before");
+        }
+    }
+}
+```
+
+```php title="database/migrations/…_add_gift_message_to_orders.php"
+public function up(): void
+{
+    Ddl::withRetry(fn () => Schema::table('orders', function (Blueprint $table) {
+        $table->string('gift_message', 100)->nullable()->instant();
+    }));
+}
+```
+
+한 번에 ALTER 한 문장만 넘긴다. `Schema::table()` 안에 컬럼이 여럿이면 문장도 여럿이라, 두 번째 문장에서 1205가 나면 첫 문장은 이미 들어간 채로 다시 시도하게 된다(실험 I2, I3). 실험 환경에서 대기 1초, 쉬는 시간 2초로 바꿔 5초짜리 트랜잭션 뒤에 돌려 보니 두 번 실패하고 세 번째에 성공했다. 대기 시간은 짧을수록 줄 선 요청이 덜 기다리고, 대신 바쁜 테이블에서는 시도가 더 자주 실패한다. 2~5초에서 시작해 우리 테이블에서 재 보고 정한다. 다 실패하면 배포를 멈추고 막는 세션을 찾는다. 1205는 행 잠금 대기에서도 나니, 마이그레이션 안에 큰 UPDATE를 넣지 않아야 이 판단이 맞는다.
+
+### ALGORITHM을 적되, instant()와 lock()은 같이 쓰지 않는다
+
+| 바꾸는 것 | 라라벨 | 비고 |
+| --- | --- | --- |
+| 컬럼 추가, 삭제 | `->instant()` | 행 버전 64개 한도. 꽉 차면 4092로 실패하니 그때 따로 계획한다 |
+| 컬럼 이름 변경 | `->renameColumn()` | 라라벨이 `instant()`를 붙이지 않지만 MySQL이 알아서 INSTANT를 고른다. 다른 테이블의 외래 키가 참조하는 컬럼은 INPLACE만 된다. 옛 코드는 깨진다(실험 K2) |
+| 인덱스, 외래 키 | `->inplace()->lock('none')` | 인덱스를 만드는 동안은 안 막지만 시작과 끝에는 메타데이터 락이 필요하다(실험 E). 외래 키 INPLACE는 외래 키 확인을 꺼야 한다 |
+| 타입 변경, VARCHAR 256바이트 경계 넘기 | 수식어로 안 된다 | COPY만 된다. 큰 테이블이면 gh-ost 같은 도구로 한다(실험 M) |
+| 컬럼 순서 변경 | 수식어로 안 된다 | INPLACE로 되지만 테이블을 다시 만든다(실험 G5처럼 오래 걸린다) |
+
+`->instant()->lock('none')`처럼 둘을 함께 쓰면 MySQL이 거절한다(실험 I2). `instant()`만 쓰면 충분하다. 반대로 아무것도 안 적으면 MySQL이 고르는데, 타입 변경이나 행 버전이 꽉 찬 테이블처럼 생각보다 무거운 알고리즘을 오류 없이 고른다(실험 G10, H2). 적어 두면 그런 변경은 배포 전에 로컬이나 스테이징에서 바로 실패한다.
+
+`--pretend`로 마이그레이션이 만들 SQL을 미리 보는 습관도 들인다. 실험 I1처럼 컬럼 수만큼 ALTER가 나가는지, 알고리즘이 붙었는지 바로 보인다. 인덱스를 여러 개 바꿀 때 Aurora의 Reader 버퍼풀 무효화를 한 번으로 줄이려면(당근 글) 라라벨 컬럼 메서드로는 안 되고 `DB::statement()`로 ALTER 한 문장을 직접 써야 한다.
+
+### 한 번에 못 바꾸는 변경은 넓히고, 옮기고, 좁힌다
+
+실험 K처럼 옛 코드를 깨뜨리는 변경은 락과 상관없이 배포 순서로 풀어야 한다. Udit의 글과 Fowler의 [ParallelChange](https://martinfowler.com/bliki/ParallelChange.html)를 흔한 변경에 대입하면 이렇다.
+
+| 변경 | 1. 넓히기 (배포 전 마이그레이션) | 2. 옮기기 (코드 배포, 백필) | 3. 좁히기 (다음 배포 이후) |
+| --- | --- | --- | --- |
+| NOT NULL 컬럼 추가 | `nullable()` 또는 `default()`로 추가 | 새 코드가 값을 채우고, 기존 행은 명령으로 채운다 | 빈 행이 없는지 확인하고 NOT NULL |
+| 컬럼 이름 변경 | 새 이름 컬럼 추가 | 두 컬럼에 함께 쓰고 옛 컬럼을 기준으로 읽는다. 백필 후 새 컬럼으로 읽기를 옮긴다 | 옛 컬럼을 쓰는 코드를 걷어 낸 배포 뒤에 옛 컬럼 삭제 |
+| 컬럼 삭제 | 없음 | 그 컬럼을 읽고 쓰는 코드부터 지우고 배포 | 다음 배포에서 컬럼 삭제 |
+| 타입 변경 | 새 타입 컬럼 추가 | 이름 변경과 같다 | 이름 변경과 같다 |
+
+공통 규칙은 하나다. 배포 중에는 옛 코드와 새 코드가 함께 돌고 큐 워커는 더 오래 옛 코드로 남으니, 스키마는 늘 두 버전과 모두 맞아야 한다. 마이그레이션이 코드 배포보다 먼저 도는 구조라면 1단계 마이그레이션은 옛 코드와 맞아야 하고, 3단계는 옛 코드가 다 사라진 다음 배포에 넣는다.
+
+### 백필은 마이그레이션 밖에서 나눠서 한다
+
+큰 테이블 백필은 실험 L2처럼 `chunkById()`로 나누고, 마이그레이션이 아니라 artisan 명령이나 큐 작업으로 돌린다. 다시 돌려도 아직 안 된 행만 고치게 조건을 넣고, 전체를 트랜잭션 하나로 감싸지 않는다. Udit의 글에 있는 명령(`customers:backfill-display-name`)이 좋은 틀이다. 복제본이 있으면 묶음 사이에 쉬면서 복제 지연을 본다.
+
+### 여러 서버에서 migrate는 한 번만, 결과는 따로 확인한다
+
+서버마다 `migrate`를 부르는 구조라면 `--isolated`를 쓴다. 다만 실험 J2처럼 실행하지 않은 쪽도 성공으로 끝나니, 종료 코드를 바꾸고 스크립트에서 구분한다.
+
+```bash
+php artisan migrate --force --isolated=75
+case $? in
+  0)  ;;                                                            # 내가 마이그레이션을 끝냈다
+  75) for i in $(seq 60); do                                        # 다른 서버가 하는 중, 최대 2분 기다린다
+        php artisan migrate:status --pending=1 > /dev/null && break
+        sleep 2
+      done
+      php artisan migrate:status --pending=1 > /dev/null || exit 1 ;;
+  *)  exit 1 ;;
+esac
+```
+
+`migrate:status --pending=1`은 아직 안 돈 마이그레이션이 있으면 종료 코드 1로 끝난다. 첫 서버의 마이그레이션이 실패하면 기다려도 끝나지 않으니 횟수를 정해 둔다. 실험 환경에서 서버 두 대를 흉내 내 돌려 보니, 마이그레이션이 성공한 경우 두 번째 서버는 첫 번째가 끝날 때까지 기다렸다가 넘어갔고, 실패한 경우에는 정한 횟수만큼 기다린 뒤 종료 코드 1로 멈췄다.
+
+마이그레이션을 서버마다 돌리지 않고 배포 파이프라인의 한 단계로 한 번만 돌리면 더 단순하다. `--isolated`는 캐시로 락을 잡으니 모든 서버가 같은 캐시 저장소(Redis, database 등)를 봐야 한다는 점도 문서에 있다.
+
+### COPY만 되는 변경은 도구로, 도구에도 시간 제한을 건다
+
+타입 변경처럼 COPY만 되는 작업을 큰 테이블에 그대로 돌리면 실험 G10처럼 그동안 쓰기가 멈춘다. 이럴 때는 gh-ost나 pt-online-schema-change를 쓴다. 다만 실험 M2처럼 도구도 cut-over에서 열린 트랜잭션을 기다리니, 앞의 세션 확인은 똑같이 필요하다. gh-ost는 `--cut-over-lock-timeout-seconds`로 cut-over 잠금 대기를 줄이고, `--postpone-cut-over-flag-file`로 복사는 미리 해 두고 cut-over만 트래픽이 적은 시간에 할 수 있다. 부하가 기준을 넘으면 복사를 잠시 멈추는 `--max-load`와, 더 높은 기준에서 마이그레이션을 중단하는 `--critical-load`가 GitHub 보고서의 차단기와 비슷한 역할을 한다.
+
+### 배포 전에 확인할 것
+
+- [ ] `migrate --pretend`로 나갈 SQL과 알고리즘을 봤다
+- [ ] ALTER 한 문장마다 `ALGORITHM`을 적었고, `instant()`와 `lock()`을 같이 쓰지 않았다
+- [ ] 옛 코드가 새 스키마에서도 돈다 (NOT NULL에 기본값, 이름 변경과 삭제는 나눠서)
+- [ ] 마이그레이션 안에 큰 UPDATE나 DELETE가 없다
+- [ ] 바꿀 테이블에 오래 열린 트랜잭션이 없다
+- [ ] 마이그레이션 세션의 `lock_wait_timeout`이 짧고, 실패하면 다시 시도한다
+- [ ] 여러 서버에서 `migrate`가 동시에 돌지 않고, 실행하지 않은 서버는 끝나기를 기다린다
+- [ ] 외래 키로 엮인 부모 테이블도 바쁜 테이블인지 봤다
+
+## 3. 개인적인 견해
+
+이번에 가장 크게 바뀐 생각은 'INSTANT니까 안전하다'는 믿음이다. 실험 A에서 행 3개짜리 테이블에 INSTANT로 컬럼 하나 추가하는 데 4초가 걸렸고, 그 4초 동안 테이블의 모든 읽기와 쓰기가 줄을 섰다. ALTER가 얼마나 걸리느냐는 알고리즘보다 그 순간 테이블에 열린 트랜잭션이 정한다. 그래서 마이그레이션을 검토할 때 'INSTANT인가'보다 '지금 이 테이블을 오래 잡고 있는 게 있는가'를 먼저 보겠다.
+
+`lock_wait_timeout` 기본값이 1년이라는 건 배포에는 맞지 않는 값이라고 본다. 오래 기다려 결국 성공하는 쪽보다 몇 초 만에 실패하고 다시 시도하는 쪽이 서비스에는 덜 아프다(실험 A와 D). 마이그레이션 세션만 짧게 잡는 일은 코드 몇 줄이면 되니, 가장 먼저 넣을 만하다.
+
+라라벨 문서도 그대로 믿으면 안 된다는 걸 이번에 배웠다. 문서가 권한 `instant()->lock('none')`은 MySQL 8.4에서 오류가 났고, 안 된다고 한 `after()->instant()`는 됐다. 프레임워크 테스트는 만들어지는 SQL 문자열만 확인해서 이런 차이를 잡지 못한다. 최근에 들어온 기능일수록 실제 DB에 한 번 돌려 보는 게 맞다. 이 경우에는 오류가 배포 중에 나면 마이그레이션이 반쯤 반영된 채로 남는다는 점(실험 I2)이 더 아팠다. 마이그레이션 하나에 ALTER 하나를 원칙으로 두려고 한다.
+
+넓히고, 옮기고, 좁히는 방식은 처음엔 번거로워 보인다. 컬럼 이름 하나 바꾸는 데 배포가 세 번 필요하다. 그래도 실험 K처럼 옛 코드가 깨지는 건 락과 달리 재시도로도 안 풀리고, 롤백해도 이미 바뀐 스키마는 그대로다. 이름 변경처럼 꼭 필요하지 않은 변경은 아예 안 하는 것도 방법이라고 생각한다.
+
+도구가 마지막 답은 아니라는 것도 기억해 두려고 한다. gh-ost는 COPY를 견딜 만하게 바꿔 주지만, cut-over에서는 똑같이 열린 트랜잭션에 걸렸고(실험 M2), GitHub는 온라인 마이그레이션의 부하가 평소 트래픽과 겹쳐 장애를 겪었다. Ninon이 맺음말에 쓴 것처럼 DB를 누가 어떻게 쓰는지 아는 게 먼저다. 우리 DB에 오래 열린 트랜잭션을 만드는 곳이 어디인지 찾아 두는 일부터 하겠다.
+
+## 참고 자료
+
+인용한 글
+
+- Simon Ninon, [Don't break production: learn about MySQL locks](https://simon-ninon.medium.com/dont-break-production-learn-about-mysql-locks-297671ec8e73), Medium, 2021-08-01
+- Udit Rawat, [Do Not Backfill Large Laravel Tables Inside a Migration](https://medium.com/@udit.rawat03/do-not-backfill-large-laravel-tables-inside-a-migration-39882bf31372), Medium, 2026-11-14
+- Eden, [Aurora MySQL 인덱스 DDL이 Reader 버퍼풀을 비운다?](https://medium.com/daangn/aurora-mysql-%EC%9D%B8%EB%8D%B1%EC%8A%A4-ddl%EC%9D%B4-reader-%EB%B2%84%ED%8D%BC%ED%92%80%EC%9D%84-%EB%B9%84%EC%9A%B4%EB%8B%A4-16c6328dea50), 당근 테크 블로그, 2026-09-17
+- joom.out, [MySQL ALTER DDL 수행 방식에 대한 이해](https://tech.kakao.com/posts/703), 카카오 기술 블로그, 2025-05-14
+- joom.out, [MySQL Ver. 8.0 New Feature: Instant DDL Algorithm에 대한 이해](https://tech.kakao.com/posts/731), 카카오 기술 블로그, 2025-09-02
+- Peter Sylvester, [Online DDL Tools and Metadata Locks](https://www.percona.com/blog/online-ddl-tools-and-metadata-locks/), Percona, 2022-11-23
+- GitHub, [GitHub availability report: May 2026](https://github.blog/news-insights/company-news/github-availability-report-may-2026/), The GitHub Blog
+- Danilo Sato, [ParallelChange](https://martinfowler.com/bliki/ParallelChange.html), martinfowler.com, 2014-05-13
+- Amy, [큐 테이블에 왜 SKIP LOCKED를 붙였을까: MySQL 잠금 읽기](./locking-reads.mdx)
+
+문서와 소스
+
+- MySQL 8.4 Reference Manual: [Metadata Locking](https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html), [Online DDL Operations](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html), [Online DDL Performance and Concurrency](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-performance.html), [ALTER TABLE](https://dev.mysql.com/doc/refman/8.4/en/alter-table.html), [lock_wait_timeout](https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_lock_wait_timeout), [The metadata_locks Table](https://dev.mysql.com/doc/refman/8.4/en/performance-schema-metadata-locks-table.html), [The schema_table_lock_waits View](https://dev.mysql.com/doc/refman/8.4/en/sys-schema-table-lock-waits.html)
+- [MySQL Bug #117745](https://bugs.mysql.com/bug.php?id=117745) (행 버전 한도 오류 번호 4092)
+- [Aurora MySQL 3.14.0 릴리스 노트](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraMySQLReleaseNotes/AuroraMySQL.Updates.3140.html) (2026-10-26)
+- Laravel 13 문서: [Migrations](https://laravel.com/docs/13.x/migrations) (Instant Column Operations, DDL Locking, Isolating Migration Execution), [Chunking Results](https://laravel.com/docs/13.x/queries#chunking-results)
+- laravel/framework v13.43.0: [MySqlGrammar.php](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Schema/Grammars/MySqlGrammar.php#L318-L326) (compileAdd), [Blueprint.php](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Schema/Blueprint.php#L194-L209) (addImpliedCommands), [Schema/Grammars/Grammar.php](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Schema/Grammars/Grammar.php#L31), [Migrator.php](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Database/Migrations/Migrator.php#L452-L455), [Console/Command.php](https://github.com/laravel/framework/blob/v13.43.0/src/Illuminate/Console/Command.php#L278-L287)
+- laravel/framework PR: [#57907](https://github.com/laravel/framework/pull/57907) (instant), [#58293](https://github.com/laravel/framework/pull/58293) (lock), [#61602](https://github.com/laravel/framework/pull/61602) (inplace)
+- [gh-ost](https://github.com/github/gh-ost) v1.1.11: [cut-over](https://github.com/github/gh-ost/blob/master/doc/cut-over.md)
