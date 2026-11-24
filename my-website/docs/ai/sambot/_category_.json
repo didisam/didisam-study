@@ -1,0 +1,8 @@
+{
+  "label": "sambot 사내 챗봇",
+  "position": 2,
+  "link": {
+    "type": "generated-index",
+    "description": "사내 지식과 운영 데이터를 근거와 함께 찾아 주는 직원용 챗봇의 기획과 설계"
+  }
+}
