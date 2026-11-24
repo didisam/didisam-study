@@ -47,3 +47,11 @@ JinhuiStudy:
   page: true
   socials:
     github: JinhuiStudy
+
+hanmyungchan:
+  name: mchan
+  url: https://github.com/hanmyungchan
+  image_url: https://github.com/hanmyungchan.png
+  page: true
+  socials:
+    github: hanmyungchan
