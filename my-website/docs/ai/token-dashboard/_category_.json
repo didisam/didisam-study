@@ -1,0 +1,8 @@
+{
+  "label": "토큰 대시보드",
+  "position": 3,
+  "link": {
+    "type": "generated-index",
+    "description": "산타 개발팀의 Claude Code · Codex 토큰 사용량 대시보드를 만들고, 그 숫자를 보며 든 생각들"
+  }
+}
