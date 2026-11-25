@@ -55,3 +55,11 @@ hanmyungchan:
   page: true
   socials:
     github: hanmyungchan
+
+giddy-kim:
+  name: 김건웅
+  url: https://github.com/giddy-kim
+  image_url: https://github.com/giddy-kim.png
+  page: true
+  socials:
+    github: giddy-kim
