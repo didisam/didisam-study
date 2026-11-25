@@ -1,0 +1,201 @@
+---
+title: "숫자 입력창에서 한글 조합을 다루는 방법 — React 입력과 IME"
+description: "입력 문자열과 폼 값을 나눠 한글 조합을 처리하고, 실제 두벌식 입력으로 React 이벤트 순서와 isTrusted의 의미를 확인했어요."
+sidebar_position: 1
+tags: [frontend, react, ime, troubleshooting]
+---
+
+수료증 발급 화면에는 교육 시간을 입력하는 일수, 시간, 분 필드가 있어요.
+숫자만 받으려고 `type="number"`를 사용했는데, 한글을 입력하다 다른 필드로 이동하면 조합 중이던 글자가 남았어요.
+
+입력 타입과 이벤트 처리를 바꾸는 것만으로는 충분하지 않았어요.
+조합 중 화면에 보일 문자열과 폼에 반영할 값을 나눠야 했어요.
+실제 키 입력에서 두 값이 언제 바뀌는지도 확인해야 했죠.
+
+## 조합을 건너뛰자 화면 값이 되돌아갔어요
+
+IME는 여러 키 입력을 조합해 문자를 만드는 입력 도구예요.
+`가`를 입력하는 동안에는 `ㄱ` 같은 완성 전 문자열도 input에 들어와요.
+
+기존 코드는 `type="text"`로 바꾼 뒤, 조합 중에 발생한 변경을 건너뛰었어요.
+숫자 필터가 조합을 방해하지 않게 하려는 처리였죠.
+
+```js
+const handleChange = (ev, name) => {
+  if (ev.nativeEvent?.isComposing) return;
+  commitNumeric(name, ev.target.value);
+};
+```
+
+그런데 이 입력창은 폼 값을 `value`로 받는 controlled input이었어요.
+React는 `onChange`에서 상태를 동기적으로 갱신하지 않으면 입력창을 `value`로 지정한 값으로 되돌려요([React 공식 문서](https://react.dev/reference/react-dom/components/input#controlling-an-input-with-a-state-variable)).
+조합 중 변경을 건너뛰면 화면 값도 함께 되돌려질 수 있었어요.
+
+수정 전 코드를 Chrome에서 확인했을 때도 `12가`가 다음 키 이벤트 전에 이미 `12`로 돌아왔어요.
+결과에 숫자만 남았다고 해서 조합 처리가 의도대로 동작했다고 볼 수는 없었어요.
+
+## 화면 문자열과 폼 값을 나눴어요
+
+[BEAT 팀의 숫자 입력 사례](https://team-beat.tistory.com/18)에도 비슷한 경험이 나와요.
+조합 중 입력 처리를 건너뛰었더니, 한글을 입력한 뒤 숫자가 입력되지 않았다고 해요.
+이 글은 조합 여부 확인을 없애고 필터링을 다음 프레임으로 미루는 방식으로 해결했어요.
+
+우리는 다른 방향을 택했어요.
+[React Aria의 NumberField 구현 글](https://react-aria.adobe.com/blog/how-we-internationalized-our-numberfield)은 IME로 입력하는 중간 문자열이 그 자체로는 유효한 숫자가 아니어서, 조합이 끝날 때까지 검증하지 않는다고 설명해요.
+[useNumberFieldState](https://react-aria.adobe.com/NumberField/useNumberFieldState)도 입력 문자열인 `inputValue`와 파싱한 숫자인 `numberValue`를 따로 가져요.
+React Aria의 예시는 중국어 IME로 숫자를 입력하는 경우예요.
+우리 화면은 한글을 숫자로 바꾸는 게 아니라 지워야 했어요.
+그래서 국제화 숫자 파서 대신 기존 `0~9` 필터를 유지하고, 두 값을 나누는 구조만 가져왔어요.
+
+일수, 시간, 분을 각각 `NumericTimeField`로 분리했어요.
+각 필드가 자신의 화면 문자열과 조합 상태를 관리하므로, 한 필드의 조합이 다른 필드의 입력을 막지 않아요.
+
+아래는 값 처리의 핵심 부분이에요.
+`value`는 해당 필드의 폼 값이고, input의 `value`에는 `inputValue`를 연결했어요.
+조합, blur 핸들러는 코드 아래 표로 정리했어요.
+
+```js
+const [inputValue, setInputValue] = useState(value);
+const composingRef = useRef(false);
+
+const commit = (raw) => {
+  const nextValue = normalizeNumeric(raw);
+  setInputValue(nextValue);
+  setFieldValue(name, nextValue);
+};
+
+const handleChange = (ev) => {
+  const raw = ev.target.value;
+  if (composingRef.current || ev.nativeEvent?.isComposing) {
+    setInputValue(raw);
+    return;
+  }
+  commit(raw);
+};
+```
+
+이제 조합 중 `12가`가 들어오면 화면에는 `12가`, 폼에는 기존 값 `12`가 남아요.
+조합이 끝나면 두 값이 모두 `12`가 돼요.
+DOM의 `value`를 직접 덮어쓰던 코드는 제거했어요.
+
+| 핸들러               | 처리                                                                    |
+| -------------------- | ----------------------------------------------------------------------- |
+| `onCompositionStart` | 해당 필드의 조합 상태를 켜요                                            |
+| 조합 중 `onChange`   | 화면 문자열만 갱신해요                                                  |
+| 일반 `onChange`      | 숫자로 정리해 화면과 폼에 반영해요                                      |
+| `onCompositionEnd`   | 조합 상태를 끄고 `commit()`을 호출해요                                  |
+| `onBlur`             | 조합 상태를 끄고 `commit()`을 호출한 뒤 Formik의 blur 핸들러를 호출해요 |
+
+`onBlur`에서도 같은 처리를 해서, 종료 이벤트를 받지 못한 경우에 대비했어요.
+해당 필드의 폼 값이 바뀌면 화면 문자열을 그 값으로 맞추고 조합 상태도 초기화해요.
+다른 필드의 값이 바뀌어도 조합 중인 문자열은 그대로 둬요.
+
+## 길이 제한은 숫자를 추린 뒤 적용해요
+
+값 정리 규칙은 숫자 외 문자 제거, 선행 0 제거, 앞 5자리 유지예요.
+`007`은 `7`, `000`은 빈 문자열이 돼요.
+
+```js
+const normalizeNumeric = (raw) =>
+  raw
+    .replace(/[^0-9]/g, "")
+    .replace(/^0+/, "")
+    .slice(0, 5);
+```
+
+대신 input의 `maxLength={5}`는 제거했어요.
+수정 전에는 브라우저가 붙여넣은 원문을 먼저 잘랐어요.
+그래서 `001234`가 `00123`으로 들어온 뒤 선행 0이 제거돼 `123`만 남았죠.
+
+이제 길이 제한은 정리 함수에서만 적용해요.
+`001234`는 `1234`, `12a34b56`은 `12345`가 돼요.
+`inputMode="numeric"`은 숫자 키보드를 요청하는 힌트로 유지했어요.
+이 속성은 입력값을 제한하지 않으므로([MDN](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Global_attributes/inputmode)), 값을 거르는 역할은 정리 함수가 맡아요.
+
+## 실제 두벌식 입력으로 값과 이벤트를 확인했어요
+
+2026년 11월 25일, macOS에서 Claude 데스크톱 앱의 내장 브라우저(Chromium 157 기반)로 수정한 컴포넌트를 분리해 띄웠어요.
+React 18.3.1과 실제 Formik, TextField를 연결하고, 키보드로 두벌식 한글을 직접 입력했어요.
+
+| 동작                                      | 화면 값              | 폼 값                |
+| ----------------------------------------- | -------------------- | -------------------- |
+| 일수 `12` 뒤에서 한글 조합                | `12가`               | `12`                 |
+| Enter로 조합 종료                         | `12`                 | `12`                 |
+| 다시 조합한 뒤 Tab으로 이동하고 시간 입력 | 일수 `12`, 시간 `34` | 일수 `12`, 시간 `34` |
+
+OS 클립보드에서 복사한 값을 붙여넣는 것도 같은 화면에서 직접 확인했어요.
+
+이어 값을 정리하지 않는 비교용 입력창에 React 핸들러 로그를 추가했어요.
+DOM의 `change`와 React의 `onChange`를 구분해 기록하기 위해서예요.
+비교용 입력에서 `가`를 입력하고 Enter를 눌렀을 때의 주요 기록은 다음과 같아요.
+
+| 순서 | DOM 이벤트               | React 핸들러                |
+| ---- | ------------------------ | --------------------------- |
+| 1    | `compositionstart`       | 관찰용 `onCompositionStart` |
+| 2    | `input`, 값 `ㄱ`         | `onChange`, 값 `ㄱ`         |
+| 3    | `input`, 값 `가`         | `onChange`, 값 `가`         |
+| 4    | 확정 시 `input`, 값 `가` | 추가 `onChange` 호출 없음   |
+| 5    | `compositionend`         | 관찰용 `onCompositionEnd`   |
+| 6    | `change`                 | 추가 `onChange` 호출 없음   |
+
+`compositionend` 이후에는 `onChange`가 다시 호출되지 않았어요.
+그래서 조합이 끝난 값은 `onChange`가 아니라 `onCompositionEnd`에서 `commit()`을 호출해 정리해요.
+이 순서는 해당 환경의 비교용 입력에서 관찰한 결과예요.
+
+### 실제 입력인데 compositionend의 isTrusted는 false였어요
+
+이 기록에는 이벤트마다 `isTrusted`도 함께 남겼어요.
+그런데 키보드로 직접 입력했는데도 `compositionend`의 `isTrusted`는 `false`였어요.
+조합 시작과 입력 이벤트는 `true`였어요.
+종료 이벤트는 React 핸들러에 도달하기 전, DOM 기록 단계부터 `false`였어요.
+
+내장 브라우저의 Chromium 버전인 `157.0.8103.78` 소스를 확인했어요.
+이 버전은 이벤트를 만들 때 `isTrusted`를 `false`로 초기화해요([event.cc](https://github.com/chromium/chromium/blob/157.0.8103.78/third_party/blink/renderer/core/dom/events/event.cc#L92)).
+일반 발행 경로인 `EventTarget::DispatchEvent()`는 이 값을 `true`로 바꿔요([event_target.cc](https://github.com/chromium/chromium/blob/157.0.8103.78/third_party/blink/renderer/core/dom/events/event_target.cc#L882)).
+반면 IME의 `compositionend`는 이 함수를 거치지 않고 별도 이벤트 큐로 전달돼요([input_method_controller.cc](https://github.com/chromium/chromium/blob/157.0.8103.78/third_party/blink/renderer/core/editing/ime/input_method_controller.cc#L326)).
+
+페이지에 호출 추적을 추가한 뒤 같은 입력을 반복해도, JavaScript의 `dispatchEvent()` 호출은 기록되지 않았어요.
+이번 관찰은 해당 Chromium의 내부 발행 방식과 일치했어요.
+
+그래서 `isTrusted` 하나만으로 실제 IME 입력과 합성 입력을 구분할 수는 없었어요.
+이 화면처럼 조합 이벤트를 다루는 코드를 검증할 때는, 입력을 어떻게 재현했는지와 어느 단계에서 이벤트를 기록했는지를 함께 남겨야 해요.
+
+## 우리 서비스에 적용할 기준
+
+이번에 확인한 내용을 숫자만 받는 다른 입력창에도 기준으로 쓰려고 해요.
+
+- controlled input에서는 조합 중에도 화면 문자열을 갱신해요.
+- 값 정리와 길이 제한은 `maxLength`나 DOM `value` 덮어쓰기가 아니라 정리 함수 한 곳에서 해요.
+- 조합이 끝난 값은 `onCompositionEnd`에서 정리하고, 종료 이벤트가 오지 않는 경우에 대비해 `onBlur`에서도 정리해요.
+
+admin-ui에서 숫자를 입력받는 곳을 찾아보니 다음과 같았어요.
+비밀번호처럼 `type="password"`인 입력은 제외했어요.
+
+| 위치                                                                                    | 현재 처리                                                                      | 적용할 점                                                                             |
+| --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| `ApproveTossRefundDialog.tsx` (환불 금액)                                               | `onChange`마다 숫자 외 문자를 지우고 바로 폼 값에 반영해요. 조합 처리는 없어요 | 조합 중 문자열은 화면에 두고, 조합이 끝난 뒤 정리하도록 바꿀지 확인해요               |
+| `BulkGradedTaskDialog` (일괄 채점 점수)                                                 | `type="tel"`과 `maxLength={3}`로 입력을 받아요                                 | `maxLength`가 원문을 먼저 잘라 결과가 달라지는 경우가 있는지 확인해요                 |
+| `features/makeClass/` 아래 기간, 가격, 할인, 이수 시간 입력 12곳과 `AddClassDialog.tsx` | `type="number"`를 써요                                                         | 수료증 화면에서 조합 중 글자가 남았던 입력 타입이라, 같은 증상이 있는지 먼저 확인해요 |
+
+같은 증상이 확인되면 `NumericTimeField`를 공용 숫자 입력 컴포넌트로 옮겨 재사용하는 방법을 검토하려고 해요.
+
+검증도 이번처럼 나눠 남기려고 해요.
+jsdom 회귀 테스트 11개는 조합 중 문자열 유지, 필드 간 격리, blur 복구, 숫자 정리, 외부 값 동기화를 지키는 용도로 유지해요.
+이벤트 순서처럼 브라우저마다 다를 수 있는 동작은 실제 키보드 입력으로 확인하고, `isTrusted`만으로 실제 입력 여부를 판단하지 않아요.
+
+수료증 발급 화면의 수정은 아직 배포 전이에요.
+배포 전에 클릭으로 조합을 끝내는 경로, 실제 환경에서 종료 이벤트가 누락됐을 때의 blur 복구, Safari와 Windows, 모바일 IME, 발급 화면 전체 흐름을 먼저 확인하려고 해요.
+
+## 참고 자료
+
+인용한 글
+
+- 김채현, [못말리는 Input 달래주기 1편 (숫자 입력)](https://team-beat.tistory.com/18), BEAT Team Blog, 2024-07-17
+- Rob Snow, [How we internationalized our number field](https://react-aria.adobe.com/blog/how-we-internationalized-our-numberfield), React Aria Blog, 2021-05-05
+
+문서와 소스
+
+- [React 문서: \<input\>](https://react.dev/reference/react-dom/components/input#controlling-an-input-with-a-state-variable) (Controlling an input with a state variable, Caveats)
+- React Aria: [useNumberFieldState](https://react-aria.adobe.com/NumberField/useNumberFieldState) (react-stately 3.48.0, inputValue, numberValue)
+- [MDN: inputmode](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Global_attributes/inputmode)
+- Chromium 157.0.8103.78 소스: [event.cc](https://github.com/chromium/chromium/blob/157.0.8103.78/third_party/blink/renderer/core/dom/events/event.cc#L92) (Event 생성자), [event_target.cc](https://github.com/chromium/chromium/blob/157.0.8103.78/third_party/blink/renderer/core/dom/events/event_target.cc#L882) (EventTarget::DispatchEvent), [input_method_controller.cc](https://github.com/chromium/chromium/blob/157.0.8103.78/third_party/blink/renderer/core/editing/ime/input_method_controller.cc#L326) (DispatchCompositionEndEvent)

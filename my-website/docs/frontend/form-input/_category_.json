@@ -1,0 +1,8 @@
+{
+  "label": "폼과 입력",
+  "position": 3,
+  "link": {
+    "type": "generated-index",
+    "description": "React 입력 처리, IME 조합, 폼 상태 관리"
+  }
+}
