@@ -1,0 +1,137 @@
+---
+title: 서버 컴포넌트란 무엇일까? 2편
+sidebar_position: 2
+tags: [frontend]
+---
+
+글. [Wren](/blog/authors/slamdunk11)
+
+## 1. 인용글 정리
+
+> What Actually Gets Sent to the Client
+
+### 서버 컴포넌트는 실제로 브라우저에 무엇을 전달할까?
+
+- 서버 컴포넌트가 렌더링 될 때 HTML을 생성하는 것이 아니라 RSC Payload를 생성
+  - RSC Payload: 서버 컴포넌트의 렌더링 결과를 React가 읽을 수 있게 직렬화한 데이터
+    - React에게 클라이언트 측 트리를 구성하는 방법을 알려주는 JSON과 유사한 명령어 스트림
+    - 서버 컴포넌트가 반환한 UI 구조, 클라이언트 컴포넌트가 들어갈 위치와 JavaScript 모듈 참조, 그 컴포넌트에 전달할 props를 포함한다.
+
+#### RSC Payload 예시(이해 돕기 위한 예시, 실제 형태는 x)
+
+```
+// app/page.tsx
+import LikeButton from './LikeButton'; // 클라이언트 컴포넌트
+
+export default function Page() { // 서버 컴포넌트
+  const title = '서비스 점검 안내';
+
+  return (
+    <main>
+      <h1>{title}</h1>
+      <LikeButton initialCount={3} />
+    </main>
+  );
+}
+```
+
+```
+// RSC Payload
+// 서버 컴포넌트인 Page 컴포넌트 내부 요소들 확인 가능
+{
+  type: 'main',
+  children: [
+    {
+      type: 'h1',
+      children: '서비스 점검 안내',
+    },
+    {
+      type: 'ClientComponentReference',
+      module: 'LikeButton',
+      props: {
+        initialCount: 3,
+      },
+    },
+  ],
+}
+```
+
+### RSC(React Server Component)의 렌더링 과정
+
+1. React는 서버 컴포넌트를 서버에서 렌더링
+2. 서버 구성 요소의 경우, 렌더링된 결과, 즉 반환된 요소가 출력되며 코드는 출력 X
+3. 서버 컴포넌트 내의 클라이언트 컴포넌트의 경우, "이 컴포넌트 마운트, 해당 속성을 전달."과 같은 참조, 자리 표시자를 출력
+4. 서버는 이 페이로드를 브라우저로 스트리밍(준비된 거 먼저 전달)
+5. 브라우저의 React는 페이로드를 읽고 최종 트리를 구성
+6. 클라이언트 구성 요소가 다운로드(클라이언트 컴포넌트 실행에 필요한 javascript 코드)되고 로드(hydration)됨, 서버 구성 요소는 이미 "렌더링"되었으므로 로드가 필요 X
+
+#### 이 과정에서 핵심은 서버 컴포넌트의 코드는 JavaScript 번들에 포함되지 않는다는 것이다!
+
+![순서도](./diagram.png)
+
+> Server Components can import and render Client Components, but Client Components cannot import Server Components.
+
+### RSC 아키텍처 핵심 규칙
+
+#### 서버 컴포넌트는 클라이언트 컴포넌트를 가져와 렌더링 가능하지만, 클라이언트 컴포넌트는 서버 컴포넌트를 가져올 수 없다!
+
+- 클라이언트 컴포넌트가 import한 코드는 브라우저에서 실행할 코드에 포함된다.
+- 서버 컴포넌트가 사용하는 서버용 DB 드라이버, 서버의 파일시스템, DB 연결 객체 등은 브라우저에 존재하지 않기 때문에 해당 코드를 가져오더라도 브라우저에서는 그대로 실행할 수 없다.
+
+### "use client"는 언제, 왜 사용하나
+
+- 클라이언트 컴포넌트는 브라우저에서 실행되는 컴포넌트이다.
+- 컴포넌트에서 브라우저 전용 기능을 사용하는 경우 "use client"로 클라이언트 컴포넌트임을 표시해준다.
+  - State (useState, useReducer)
+  - Effects (useEffect, useLayoutEffect)
+  - Event handlers (onClick, onSubmit)
+  - Browser APIs (localStorage, window, document)
+  - Hooks that depend on browser context (useRouter in some cases, useMediaQuery)
+
+> 대부분의 개발자들이 저지르는 실수는 바로 "use client"컴포넌트 트리의 너무 높은 위치에 추가하는 것
+
+- 트리의 높은 위치에 use client 를 추가하면 브라우저 전송이 필요 없는 정적 요소 마저 브라우저에 전송될 수 있기 때문에
+- 저자는 클라이언트 컴포넌트를 리프 노드(자식이 없는 노드)로 가져올 것을 추천한다.
+
+### Interleaving: RSC를 강력하게 만드는 패턴
+
+- 인터리빙(Interleaving)은 서버에서 만든 UI를 클라이언트 컴포넌트의 children 같은 prop으로 전달해서, 두 종류의 컴포넌트를 중첩해 조합하는 패턴
+- 상호작용이 필요한 부분을 클라이언트, 그 안의 콘텐츠 생성 코드는 서버에 유지해서 서버에서만 사용할 코드를 브라우저에 보내지 않아도 되는 이점이 있다!
+
+```ts
+// page.tsx — 서버 컴포넌트: 아코디언과 강의 정보 조합
+
+import Accordion from './Accordion';
+// 클라이언트 컴포넌트: 접기-펼치기 상태, 클릭 처리
+import LectureDetails from './LectureDetails';
+// 서버 컴포넌트: 강의 정보 조회 및 UI 구성
+
+export default function Page() {
+  return (
+    <Accordion>
+      <LectureDetails lectureId='lecture-1' />
+      // 클라이언트 컴포넌트인 Accordion 내에서 import x, 서버 컴포넌트인 Page 에서
+      import해서 사용 // 단순 ui라면 클라이언트 내부 import 가능하나, server only
+      지정했거나 서버용 데이터 조회 있는 경우는 x
+    </Accordion>
+  );
+}
+```
+
+이렇게 prop으로 서버 컴포넌트를 전달할 수도 있는데
+함수가 아니라 엘리먼트의 형태로 전달한다
+
+```ts
+// 서버 컴포넌트 안에서 작성
+<ClientPanel content={<LectureDetails lectureId='lecture-1' />} />
+```
+
+## 개인적인 생각
+
+페이지네이션을 생각했을 때
+서버 컴포넌트와 클라이언트 컴포넌트 조합으로만 구현도 가능하고
+서버 컴포넌트로 처음 데이터 준비하고 이후의 클라이언트에
+tanstack query를 적용해 처음 데이터를 이어받아 이후 갱신을 관리하도록 구성할 수도 있다고 한다.
+
+후자의 방식을 주로 사용했기 때문에 서버 컴포넌트로만 페이지 변경 시 데이터 받아오는 동작을 할 수 있는 지가 궁금했는데
+가능하다고 하니까 다양하게 상황에 따라 써볼 수 있을 거 같다!
